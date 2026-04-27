@@ -3,6 +3,7 @@ import type { Request, Response, Router } from "express";
 import { Router as createRouter } from "express";
 import { z } from "zod";
 import { db } from "../db.js";
+import { insertFinanceCashExpense } from "../financeCashExpense.js";
 import { requireAuth, type AuthedRequest } from "../middleware/requireAuth.js";
 import { requireAnyPermission } from "../middleware/requirePermission.js";
 
@@ -76,6 +77,23 @@ function normalizeOccurredAt(raw: string): string {
   const t = raw.trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return `${t}T12:00:00`;
   return t;
+}
+
+function getMovementWithJoins(id: string): Record<string, unknown> | undefined {
+  return db
+    .prepare(
+      `SELECT m.id, m.category, m.occurred_at AS occurredAt, m.source_account_id AS sourceAccountId,
+              m.target_account_id AS targetAccountId, m.amount, m.currency, m.label, m.note,
+              m.created_at AS createdAt, m.created_by_user_id AS createdByUserId,
+              sa.label AS sourceAccountLabel, ta.label AS targetAccountLabel,
+              u.name AS createdByName
+       FROM finance_cash_movements m
+       LEFT JOIN finance_cash_accounts sa ON sa.id = m.source_account_id
+       LEFT JOIN finance_cash_accounts ta ON ta.id = m.target_account_id
+       LEFT JOIN users u ON u.id = m.created_by_user_id
+       WHERE m.id = ?`,
+    )
+    .get(id) as Record<string, unknown> | undefined;
 }
 
 export function cashBookRoutes(): Router {
@@ -210,6 +228,29 @@ export function cashBookRoutes(): Router {
     const currency = data.currency;
     let sourceId = data.sourceAccountId?.trim() || null;
     let targetId = data.targetAccountId?.trim() || null;
+    const userId = req.auth?.sub ?? null;
+
+    if (data.category === "expense") {
+      const ins = insertFinanceCashExpense({
+        userId,
+        occurredAt: data.occurredAt,
+        sourceAccountId: data.sourceAccountId ?? "",
+        amount: data.amount,
+        currency: data.currency,
+        label: data.label,
+        note: data.note,
+      });
+      if (!ins.ok) {
+        const body: { code: string; field?: string; hint?: string } = { code: ins.code };
+        if (ins.field) body.field = ins.field;
+        if (ins.hint) body.hint = ins.hint;
+        res.status(400).json(body);
+        return;
+      }
+      const row = getMovementWithJoins(ins.id);
+      res.status(201).json({ movement: row });
+      return;
+    }
 
     const src = sourceId ? getAccount(sourceId) : undefined;
     const tgt = targetId ? getAccount(targetId) : undefined;
@@ -224,17 +265,6 @@ export function cashBookRoutes(): Router {
     };
 
     switch (data.category) {
-      case "expense":
-        if (!sourceId || targetId) {
-          res.status(400).json({ code: "invalid_accounts", hint: "expense requires source only" });
-          return;
-        }
-        if (!src) {
-          res.status(400).json({ code: "unknown_account" });
-          return;
-        }
-        if (!ensureCurrency(src, "source")) return;
-        break;
       case "bank_deposit":
         if (!sourceId || !targetId) {
           res.status(400).json({ code: "invalid_accounts", hint: "bank_deposit requires source and target" });
@@ -293,7 +323,6 @@ export function cashBookRoutes(): Router {
     }
 
     const id = randomUUID();
-    const userId = req.auth?.sub ?? null;
     try {
       db.prepare(
         `INSERT INTO finance_cash_movements
@@ -317,20 +346,7 @@ export function cashBookRoutes(): Router {
       return;
     }
 
-    const row = db
-      .prepare(
-        `SELECT m.id, m.category, m.occurred_at AS occurredAt, m.source_account_id AS sourceAccountId,
-                m.target_account_id AS targetAccountId, m.amount, m.currency, m.label, m.note,
-                m.created_at AS createdAt, m.created_by_user_id AS createdByUserId,
-                sa.label AS sourceAccountLabel, ta.label AS targetAccountLabel,
-                u.name AS createdByName
-         FROM finance_cash_movements m
-         LEFT JOIN finance_cash_accounts sa ON sa.id = m.source_account_id
-         LEFT JOIN finance_cash_accounts ta ON ta.id = m.target_account_id
-         LEFT JOIN users u ON u.id = m.created_by_user_id
-         WHERE m.id = ?`,
-      )
-      .get(id) as Record<string, unknown>;
+    const row = getMovementWithJoins(id);
     res.status(201).json({ movement: row });
   });
 

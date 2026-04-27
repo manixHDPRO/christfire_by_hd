@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { Router as createRouter } from "express";
 import { z } from "zod";
 import { db } from "../db.js";
+import { insertFinanceCashExpense } from "../financeCashExpense.js";
 import { getQtyReceivedForPurchaseOrderItem } from "../inventoryPoShared.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { requireAnyPermission } from "../middleware/requirePermission.js";
@@ -15,6 +16,7 @@ const approveDgPerm = requireAnyPermission("logistics.po_approve_dg");
 const approverLinesPerm = requireAnyPermission("logistics.po_approve_manager", "logistics.po_approve_dg");
 const releaseFinancePerm = requireAnyPermission("logistics.po_release_finance");
 const releaseAccountingPerm = requireAnyPermission("logistics.po_release_accounting");
+const cashBookPerm = requireAnyPermission("finance.cash_book");
 function requireRejectPurchaseOrder(req, res, next) {
     const role = req.auth?.role;
     if (!role) {
@@ -105,6 +107,8 @@ function loadPoDetail(poId) {
               p.accounting_released_by_user_id AS accountingReleasedByUserId,
               p.accounting_released_at AS accountingReleasedAt,
               p.accounting_funding_detail AS accountingFundingDetail,
+              p.supplier_payment_recorded_at AS supplierPaymentRecordedAt,
+              p.supplier_payment_movement_id AS supplierPaymentMovementId,
               p.rejected_by_user_id AS rejectedByUserId, p.rejected_at AS rejectedAt, p.rejection_note AS rejectionNote,
               s.name AS supplierName,
               uc.name AS createdByName,
@@ -169,6 +173,7 @@ export function inventoryPurchaseOrderRoutes() {
                 p.submitted_at AS submittedAt, s.name AS supplierName,
                 p.manager_approved_at AS managerApprovedAt, p.dg_approved_at AS dgApprovedAt,
                 p.finance_released_at AS financeReleasedAt, p.accounting_released_at AS accountingReleasedAt,
+                p.supplier_payment_recorded_at AS supplierPaymentRecordedAt,
                 (SELECT IFNULL(CAST(ROUND(SUM(l.qty_ordered * l.unit_cost_cdf_est)) AS INTEGER), 0)
                    FROM stock_purchase_order_lines l WHERE l.purchase_order_id = p.id) AS estimatedTotalCdf
          FROM stock_purchase_orders p
@@ -213,6 +218,93 @@ export function inventoryPurchaseOrderRoutes() {
             return;
         }
         res.json({ purchaseOrder: detail });
+    });
+    /** Un seul paiement fournisseur total (CDF) : dépense livre de caisse + verrou sur le bon. */
+    r.post("/purchase-orders/:id/supplier-payment", requireAuth, cashBookPerm, (req, res) => {
+        const poId = routeParamId(req.params.id);
+        const bodySchema = z.object({
+            occurredAt: z.string().min(10).max(40),
+            sourceAccountId: z.string().min(1).max(80),
+            note: z.string().max(1000).optional().default(""),
+        });
+        const parsed = bodySchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ code: "validation_error" });
+            return;
+        }
+        const userId = req.auth?.sub ?? null;
+        const txResult = db.transaction((pid: string) => {
+            const row = db
+                .prepare(`SELECT p.id, p.status, p.external_ref AS externalRef, s.name AS supplierName,
+         p.supplier_payment_recorded_at AS spr
+         FROM stock_purchase_orders p
+         JOIN stock_suppliers s ON s.id = p.supplier_id
+         WHERE p.id = ?`)
+                .get(pid);
+            if (!row)
+                return { type: "not_found" };
+            if (row.status !== "approved")
+                return { type: "invalid_status" };
+            if (row.spr)
+                return { type: "already_paid" };
+            const lineSum = db
+                .prepare(`SELECT IFNULL(CAST(ROUND(SUM(l.qty_ordered * l.unit_cost_cdf_est)) AS INTEGER), 0) AS t
+         FROM stock_purchase_order_lines l WHERE l.purchase_order_id = ?`)
+                .get(pid);
+            const amount = lineSum?.t ?? 0;
+            if (amount < 1)
+                return { type: "zero_total" };
+            const ref = row.externalRef || pid.slice(0, 8);
+            const noteParts = [`Bon de commande ${ref}`, row.supplierName, `id ${pid}`];
+            const extra = parsed.data.note.trim();
+            if (extra)
+                noteParts.push(extra);
+            const ins = insertFinanceCashExpense({
+                userId,
+                occurredAt: parsed.data.occurredAt,
+                sourceAccountId: parsed.data.sourceAccountId,
+                amount,
+                currency: "CDF",
+                label: `Paiement fournisseur · ${ref}`,
+                note: noteParts.join(" · "),
+            });
+            if (!ins.ok)
+                return { type: "finance", fin: ins };
+            const u = db
+                .prepare(`UPDATE stock_purchase_orders
+         SET supplier_payment_recorded_at = datetime('now'),
+             supplier_payment_movement_id = @mid
+         WHERE id = @id AND supplier_payment_recorded_at IS NULL`)
+                .run({ mid: ins.id, id: pid });
+            if (u.changes !== 1) {
+                db.prepare(`DELETE FROM finance_cash_movements WHERE id = ?`).run(ins.id);
+                return { type: "already_paid" };
+            }
+            return { type: "ok", movementId: ins.id };
+        })(poId);
+        if (txResult.type === "not_found") {
+            res.status(404).json({ code: "not_found" });
+            return;
+        }
+        if (txResult.type === "invalid_status") {
+            res.status(400).json({ code: "invalid_status" });
+            return;
+        }
+        if (txResult.type === "already_paid") {
+            res.status(400).json({ code: "already_paid" });
+            return;
+        }
+        if (txResult.type === "zero_total") {
+            res.status(400).json({ code: "zero_total" });
+            return;
+        }
+        if (txResult.type === "finance") {
+            const f = txResult.fin;
+            res.status(400).json({ code: f.code, field: f.field, hint: f.hint });
+            return;
+        }
+        const detail = loadPoDetail(poId);
+        res.status(201).json({ purchaseOrder: detail, movementId: txResult.movementId });
     });
     r.post("/purchase-orders", requireAuth, logisticsPerm, (req, res) => {
         const schema = z.object({

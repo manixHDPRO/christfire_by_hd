@@ -1,10 +1,12 @@
 import { OrbitalSidebar } from "@/components/nav/OrbitalSidebar";
 import { CommandPalette } from "@/components/nav/CommandPalette";
+import { usePurchaseOrderSubmittedNotifierForApprovers } from "@/hooks/usePurchaseOrderSubmittedNotifierForApprovers";
 import { motion } from "framer-motion";
 import { Outlet } from "react-router-dom";
 import { useCallback, useEffect, useState } from "react";
 
 export function AppShell() {
+  usePurchaseOrderSubmittedNotifierForApprovers();
   const [cmdOpen, setCmdOpen] = useState(false);
 
   const toggleCmd = useCallback(() => setCmdOpen((o) => !o), []);

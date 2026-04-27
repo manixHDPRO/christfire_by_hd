@@ -1106,6 +1106,12 @@ db.exec(`
     if (!poFundingCols.some((c) => c.name === "accounting_funding_detail")) {
       db.exec(`ALTER TABLE stock_purchase_orders ADD COLUMN accounting_funding_detail TEXT NOT NULL DEFAULT ''`);
     }
+    if (!poFundingCols.some((c) => c.name === "supplier_payment_recorded_at")) {
+      db.exec(`ALTER TABLE stock_purchase_orders ADD COLUMN supplier_payment_recorded_at TEXT`);
+    }
+    if (!poFundingCols.some((c) => c.name === "supplier_payment_movement_id")) {
+      db.exec(`ALTER TABLE stock_purchase_orders ADD COLUMN supplier_payment_movement_id TEXT`);
+    }
   }
 
   const doccols = db.prepare("PRAGMA table_info(stock_documents)").all() as { name: string }[];

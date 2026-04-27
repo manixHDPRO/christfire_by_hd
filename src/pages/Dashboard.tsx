@@ -1,12 +1,15 @@
+import { useAuth } from "@/auth/AuthContext";
 import { Breadcrumb } from "@/components/layout/Breadcrumb";
-import { apiUrl } from "@/lib/api";
+import { apiListPurchaseOrders, apiUrl } from "@/lib/api";
+import { userHasAnyPermission } from "@/lib/permissions";
 import { reservationBungalowIds, normalizeReservationFromApi } from "@/lib/reservationBungalows";
 import { reservationPaymentStatus, reservationsOpenForBilling } from "@/lib/reservationBilling";
 import { reservationGrandTotal } from "@/lib/reservationPayment";
 import type { Bungalow, Client, Reservation } from "@/types";
 import { motion } from "framer-motion";
-import { AlertTriangle, CalendarCheck, Flame, TrendingUp, Wallet } from "lucide-react";
+import { AlertTriangle, CalendarCheck, ClipboardList, Flame, TrendingUp, Wallet } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Bar,
   BarChart,
@@ -22,13 +25,51 @@ import {
 
 const COLORS = { Premium: "#911915", Deluxe: "#F9A825", Standard: "#FFF7D6" };
 
+/** Aligné sur `poReaderPerm` côté API (liste des bons de commande). */
+const PO_DASHBOARD_READ_PERMS = [
+  "logistics.inventory",
+  "logistics.po_approve_manager",
+  "logistics.po_approve_dg",
+  "logistics.po_release_finance",
+  "logistics.po_release_accounting",
+] as const;
+
+const PO_APPROVER_PERMS = ["logistics.po_approve_manager", "logistics.po_approve_dg"] as const;
+
+type DashboardAlert = { type: "info" | "warn"; text: string };
+
 export function Dashboard() {
+  const { user } = useAuth();
   const [reservations, setReservations] = useState<Reservation[]>([]);
   const [bungalows, setBungalows] = useState<Bungalow[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [loading, setLoading] = useState(true);
   const [apiError, setApiError] = useState(false);
   const [dashboardPartial, setDashboardPartial] = useState(false);
+  /** Nombre de BC au statut « soumis » (en attente d’approbation). `null` = pas chargé ou pas le droit de lecture. */
+  const [submittedPoCount, setSubmittedPoCount] = useState<number | null>(null);
+
+  const canReadPoOnDashboard = useMemo(
+    () => userHasAnyPermission(user, PO_DASHBOARD_READ_PERMS),
+    [user],
+  );
+  const isPoApprover = useMemo(() => userHasAnyPermission(user, PO_APPROVER_PERMS), [user]);
+
+  useEffect(() => {
+    if (!canReadPoOnDashboard) {
+      setSubmittedPoCount(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const rows = await apiListPurchaseOrders("submitted");
+      if (cancelled) return;
+      setSubmittedPoCount(rows === null ? null : rows.length);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [canReadPoOnDashboard]);
 
   useEffect(() => {
     let cancelled = false;
@@ -167,8 +208,9 @@ export function Dashboard() {
 
   const openBillingCount = useMemo(() => reservationsOpenForBilling(reservations), [reservations]);
 
-  const alerts = useMemo(() => {
-    const out: { text: string; type: "info" | "warn" }[] = [];
+  const alerts = useMemo((): DashboardAlert[] => {
+    const out: DashboardAlert[] = [];
+
     const unpaid = reservations.filter(
       (r) =>
         reservationPaymentStatus(r) !== "Payé" &&
@@ -233,6 +275,49 @@ export function Dashboard() {
           Certains indicateurs sont masqués : votre rôle n’inclut pas tous les droits « Hébergement » (réservations,
           bungalows, etc.). Les sections correspondantes restent disponibles si elles vous sont ouvertes.
         </p>
+      ) : null}
+
+      {!apiError &&
+      !loading &&
+      submittedPoCount != null &&
+      submittedPoCount > 0 &&
+      canReadPoOnDashboard ? (
+        <div
+          className={`mb-4 flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded-r-md border border-y border-r border-white/10 py-1.5 pl-2.5 pr-3 text-[12px] leading-tight ${
+            isPoApprover
+              ? "border-l-4 border-l-amber-500/75 bg-white/[0.02]"
+              : "border-l-4 border-l-sky-500/55 bg-white/[0.02]"
+          }`}
+          role="status"
+          aria-live="polite"
+        >
+          <ClipboardList
+            className={`h-3.5 w-3.5 shrink-0 ${isPoApprover ? "text-amber-400/90" : "text-sky-400/85"}`}
+            aria-hidden
+          />
+          <span className="font-medium text-white/88">
+            {isPoApprover ? "BC à viser" : "BC en attente"}
+            <span className="font-normal text-white/55"> — </span>
+          </span>
+          <span className="text-white/65">
+            {isPoApprover
+              ? submittedPoCount === 1
+                ? "1 soumis par la logistique (Manager ou DG)."
+                : `${submittedPoCount} soumis par la logistique (Manager ou DG).`
+              : submittedPoCount === 1
+                ? "1 bon après soumission logistique."
+                : `${submittedPoCount} bons après soumission logistique.`}
+          </span>
+          <span className="hidden text-white/25 sm:inline" aria-hidden>
+            ·
+          </span>
+          <Link
+            to="/logistique/commandes"
+            className="shrink-0 font-medium text-brand-orange/90 underline decoration-brand-orange/35 underline-offset-2 hover:text-brand-orange sm:no-underline sm:hover:underline"
+          >
+            Ouvrir
+          </Link>
+        </div>
       ) : null}
 
       {loading ? (

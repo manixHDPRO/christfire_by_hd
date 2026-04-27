@@ -2,12 +2,13 @@ import { useAuth } from "@/auth/AuthContext";
 import {
   apiApprovePurchaseOrderDg,
   apiApprovePurchaseOrderManager,
-  apiCreateFinanceCashMovement,
   apiCreatePurchaseOrder,
+  apiGetExchangeRate,
   apiGetPurchaseOrder,
   apiListFinanceCashAccounts,
   apiListPurchaseOrders,
   apiPatchPurchaseOrder,
+  apiRecordPurchaseOrderSupplierPayment,
   apiRejectPurchaseOrder,
   apiReleasePurchaseOrderAccounting,
   apiReleasePurchaseOrderFinance,
@@ -15,7 +16,11 @@ import {
   apiSubmitPurchaseOrder,
 } from "@/lib/api";
 import { MessageDialog } from "@/components/ui/MessageDialog";
-import { parseLedgerIntegerInput } from "@/lib/parseLedgerIntegerInput";
+import {
+  playPurchaseOrderApprovalChime,
+  playPurchaseOrderSubmittedChime,
+  suppressRemotePurchaseOrderSubmitSoundForMs,
+} from "@/lib/notificationSounds";
 import { userHasPermission } from "@/lib/permissions";
 import type { FinanceCashAccount, PurchaseOrderDetail, PurchaseOrderListRow, StockItem, StockSupplier } from "@/types";
 import { Eye, FileText, Plus, Printer, RefreshCw, Wallet, X } from "lucide-react";
@@ -33,6 +38,16 @@ const STATUS_FR: Record<string, string> = {
 
 function formatPoCdf(n: number) {
   return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 }).format(Math.round(n));
+}
+
+function formatPoUsd(n: number) {
+  return new Intl.NumberFormat("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+}
+
+/** Conversion indicative : taux = CDF pour 1 USD (paramètres application). */
+function cdfToUsd(cdf: number, cdfPerUsd: number | null): number | null {
+  if (cdfPerUsd == null || cdfPerUsd <= 0 || !Number.isFinite(cdfPerUsd)) return null;
+  return cdf / cdfPerUsd;
 }
 
 function formatPoWhen(iso: string | null | undefined) {
@@ -98,22 +113,19 @@ export function PurchaseOrdersPanel({
   const [payAccounts, setPayAccounts] = useState<FinanceCashAccount[]>([]);
   const [payAccountsLoading, setPayAccountsLoading] = useState(false);
   const [paySourceId, setPaySourceId] = useState("");
-  const [payAmountStr, setPayAmountStr] = useState("");
-  const [payCurrency, setPayCurrency] = useState<"CDF" | "USD">("CDF");
   const [payOccurredAt, setPayOccurredAt] = useState("");
   const [payExtraNote, setPayExtraNote] = useState("");
   const [paySubmitBusy, setPaySubmitBusy] = useState(false);
   const [payFormErr, setPayFormErr] = useState<string | null>(null);
+  const [fxCdfPerUsd, setFxCdfPerUsd] = useState<number | null>(null);
 
-  const payAccountsForCurrency = useMemo(
-    () => payAccounts.filter((a) => a.currency === payCurrency),
-    [payAccounts, payCurrency],
-  );
+  /** Paiement BC lié : uniquement CDF, montant = total des lignes (serveur). */
+  const payAccountsCdf = useMemo(() => payAccounts.filter((a) => a.currency === "CDF"), [payAccounts]);
 
   useEffect(() => {
     if (!paySourceId) return;
-    if (!payAccountsForCurrency.some((a) => a.id === paySourceId)) setPaySourceId("");
-  }, [payAccountsForCurrency, paySourceId]);
+    if (!payAccountsCdf.some((a) => a.id === paySourceId)) setPaySourceId("");
+  }, [payAccountsCdf, paySourceId]);
 
   const reloadList = useCallback(async () => {
     setLoading(true);
@@ -131,6 +143,10 @@ export function PurchaseOrdersPanel({
   useEffect(() => {
     void reloadList();
   }, [reloadList]);
+
+  useEffect(() => {
+    void apiGetExchangeRate().then((r) => setFxCdfPerUsd(r?.cdfPerUsd ?? null));
+  }, []);
 
   const loadDetail = useCallback(async (id: string) => {
     setDetailLoading(true);
@@ -179,12 +195,14 @@ export function PurchaseOrdersPanel({
   }, [supplierPayOpen]);
 
   const openSupplierPayment = useCallback(async () => {
-    if (!detail || detail.status !== "approved") return;
+    if (!detail || detail.status !== "approved" || detail.supplierPaymentRecordedAt) return;
+    if (detail.estimatedTotalCdf < 1) {
+      setFlash("Le total estimé du bon est nul : impossible d’enregistrer un paiement fournisseur.");
+      return;
+    }
     setPayFormErr(null);
     setSupplierPayOpen(true);
     setPayOccurredAt(localDateKey(new Date()));
-    setPayAmountStr(String(Math.max(0, Math.round(detail.estimatedTotalCdf))));
-    setPayCurrency("CDF");
     setPaySourceId("");
     setPayExtraNote("");
     setPayAccountsLoading(true);
@@ -195,53 +213,48 @@ export function PurchaseOrdersPanel({
 
   const submitSupplierPayment = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!detail || detail.status !== "approved") return;
+    if (!detail || detail.status !== "approved" || detail.supplierPaymentRecordedAt) return;
     setPayFormErr(null);
-    const amount = parseLedgerIntegerInput(payAmountStr);
-    if (!Number.isFinite(amount) || amount < 1) {
-      setPayFormErr("Indiquez un montant entier ≥ 1.");
-      return;
-    }
-    if (amount > Number.MAX_SAFE_INTEGER) {
-      setPayFormErr(`Montant trop élevé (max ${Number.MAX_SAFE_INTEGER.toLocaleString("fr-FR")}).`);
-      return;
-    }
     if (!paySourceId.trim()) {
       setPayFormErr("Choisissez le compte (caisse ou banque) d’où part le paiement.");
       return;
     }
     setPaySubmitBusy(true);
-    const ref = detail.externalRef || detail.id.slice(0, 8);
-    const noteParts = [`Bon de commande ${ref}`, detail.supplierName, `id ${detail.id}`];
-    if (payExtraNote.trim()) noteParts.push(payExtraNote.trim());
-    const res = await apiCreateFinanceCashMovement({
-      category: "expense",
+    const res = await apiRecordPurchaseOrderSupplierPayment(detail.id, {
       occurredAt: payOccurredAt.trim() || localDateKey(new Date()),
       sourceAccountId: paySourceId.trim(),
-      targetAccountId: null,
-      amount,
-      currency: payCurrency,
-      label: `Paiement fournisseur · ${ref}`,
-      note: noteParts.join(" · "),
+      note: payExtraNote.trim() || undefined,
     });
     setPaySubmitBusy(false);
     if (!res.ok) {
       const msg =
-        res.code === "currency_mismatch"
-          ? "La devise ne correspond pas au compte choisi."
-          : res.code === "unknown_account"
-            ? "Compte introuvable ou inactif."
-            : res.code === "invalid_accounts"
-              ? "Compte source invalide pour une dépense."
-              : res.code === "forbidden"
-                ? "Droits insuffisants sur le livre de caisse."
-                : "Enregistrement refusé. Vérifiez le montant et le compte.";
+        res.code === "already_paid"
+          ? "Ce bon a déjà un paiement fournisseur enregistré."
+          : res.code === "zero_total"
+            ? "Le total du bon est nul : paiement impossible."
+            : res.code === "invalid_status"
+              ? "Le bon n’est pas au statut approuvé."
+              : res.code === "currency_mismatch"
+                ? "Le compte choisi n’est pas en CDF (le paiement BC est en CDF, total des lignes)."
+                : res.code === "unknown_account"
+                  ? "Compte introuvable ou inactif."
+                  : res.code === "forbidden"
+                    ? "Droits insuffisants sur le livre de caisse."
+                    : "Enregistrement refusé. Vérifiez le compte et la date.";
       setPayFormErr(msg);
       return;
     }
+    setDetail(res.purchaseOrder);
     setSupplierPayOpen(false);
-    setFlash(`Paiement fournisseur enregistré au livre de caisse (${formatPoCdf(amount)} ${payCurrency}).`);
+    setFlash(
+      `Paiement fournisseur enregistré : ${formatPoCdf(detail.estimatedTotalCdf)} CDF${
+        cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd) != null
+          ? ` (≈ ${formatPoUsd(cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd)!)} USD)`
+          : ""
+      } au livre de caisse (total du bon).`,
+    );
     onDataChanged?.();
+    await reloadList();
   };
 
   const refreshAll = async () => {
@@ -321,12 +334,22 @@ export function PurchaseOrdersPanel({
     await reloadList();
   };
 
-  const act = async (label: string, fn: () => Promise<{ ok: boolean }>) => {
+  const act = async (
+    label: string,
+    fn: () => Promise<{ ok: boolean }>,
+    sound?: "po_submitted" | "po_approved",
+  ) => {
     setBusy(true);
     setFlash(null);
     const r = await fn();
     setBusy(false);
     if (r.ok) {
+      if (sound === "po_submitted") {
+        suppressRemotePurchaseOrderSubmitSoundForMs(45_000);
+        playPurchaseOrderSubmittedChime();
+      } else if (sound === "po_approved") {
+        playPurchaseOrderApprovalChime();
+      }
       setFlash(label);
       await refreshAll();
     } else setFlash("Action refusée ou erreur réseau.");
@@ -485,6 +508,12 @@ export function PurchaseOrdersPanel({
             <Plus className="h-3.5 w-3.5" /> Ligne
           </button>
         </div>
+        {fxCdfPerUsd != null ? (
+          <p className="text-[10px] text-white/35">
+            Équivalents USD sur le détail / l’aperçu : taux indicatif 1 USD = {formatPoCdf(fxCdfPerUsd)} CDF
+            (Paramètres).
+          </p>
+        ) : null}
         <button
           type="submit"
           disabled={busy}
@@ -533,7 +562,13 @@ export function PurchaseOrdersPanel({
                     <span className="block text-xs text-white/55">{row.supplierName}</span>
                     <span className="mt-0.5 inline-block rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
                       {STATUS_FR[row.status] ?? row.status}
+                      {row.status === "approved" && row.supplierPaymentRecordedAt ? " · Payé fourn." : ""}
                     </span>
+                    {fxCdfPerUsd != null && row.estimatedTotalCdf > 0 && cdfToUsd(row.estimatedTotalCdf, fxCdfPerUsd) != null ? (
+                      <span className="mt-0.5 block font-mono text-[10px] text-white/40">
+                        ≈ {formatPoUsd(cdfToUsd(row.estimatedTotalCdf, fxCdfPerUsd)!)} USD
+                      </span>
+                    ) : null}
                   </button>
                 </li>
               ))
@@ -570,6 +605,32 @@ export function PurchaseOrdersPanel({
                   </button>
                 ) : null}
               </header>
+              <p className="text-sm text-white/70">
+                Total estimé :{" "}
+                <span className="font-mono tabular-nums text-brand-cream/95">
+                  {formatPoCdf(detail.estimatedTotalCdf)} CDF
+                </span>
+                {cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd) != null ? (
+                  <>
+                    {" "}
+                    <span className="text-white/45">·</span> ≈{" "}
+                    <span className="font-mono tabular-nums text-white/70">
+                      {formatPoUsd(cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd)!)}
+                    </span>{" "}
+                    USD
+                  </>
+                ) : null}
+                {fxCdfPerUsd != null ? (
+                  <span className="ml-1 block text-[10px] text-white/35 sm:ml-2 sm:inline">
+                    (conversion indicative : 1 USD = {formatPoCdf(fxCdfPerUsd)} CDF)
+                  </span>
+                ) : null}
+                {fxCdfPerUsd == null ? (
+                  <span className="ml-1 block text-[10px] text-amber-200/60 sm:inline">
+                    Taux CDF/USD indisponible — ouvrez la session ou configurez le taux dans Paramètres.
+                  </span>
+                ) : null}
+              </p>
 
               {detail.status === "draft" ? (
                 <div className="space-y-3 border-t border-white/10 pt-4">
@@ -695,6 +756,11 @@ export function PurchaseOrdersPanel({
                       </div>
                     ))}
                   </div>
+                  {fxCdfPerUsd != null ? (
+                    <p className="text-[10px] text-white/35">
+                      Équivalents USD : 1 USD = {formatPoCdf(fxCdfPerUsd)} CDF (indicatif, voir aperçu du bon).
+                    </p>
+                  ) : null}
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
@@ -708,11 +774,15 @@ export function PurchaseOrdersPanel({
                       type="button"
                       disabled={busy}
                       onClick={() =>
-                        void act("Bon soumis pour approbation.", async () => {
-                          const r = await apiSubmitPurchaseOrder(detail.id);
-                          if (r.ok) setDetail(r.purchaseOrder);
-                          return { ok: r.ok };
-                        })
+                        void act(
+                          "Bon soumis pour approbation.",
+                          async () => {
+                            const r = await apiSubmitPurchaseOrder(detail.id);
+                            if (r.ok) setDetail(r.purchaseOrder);
+                            return { ok: r.ok };
+                          },
+                          "po_submitted",
+                        )
                       }
                       className="rounded-xl bg-gradient-to-r from-brand-red to-brand-red-orange px-4 py-2 text-xs font-semibold text-white disabled:opacity-40"
                     >
@@ -737,11 +807,15 @@ export function PurchaseOrdersPanel({
                           type="button"
                           disabled={busy}
                           onClick={() =>
-                            void act("Approbation Manager enregistrée.", async () => {
-                              const r = await apiApprovePurchaseOrderManager(detail.id);
-                              if (r.ok) setDetail(r.purchaseOrder);
-                              return { ok: r.ok };
-                            })
+                            void act(
+                              "Approbation Manager enregistrée.",
+                              async () => {
+                                const r = await apiApprovePurchaseOrderManager(detail.id);
+                                if (r.ok) setDetail(r.purchaseOrder);
+                                return { ok: r.ok };
+                              },
+                              "po_approved",
+                            )
                           }
                           className="mt-2 rounded-lg bg-emerald-600/80 px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-40"
                         >
@@ -761,11 +835,15 @@ export function PurchaseOrdersPanel({
                           type="button"
                           disabled={busy}
                           onClick={() =>
-                            void act("Approbation DG enregistrée.", async () => {
-                              const r = await apiApprovePurchaseOrderDg(detail.id);
-                              if (r.ok) setDetail(r.purchaseOrder);
-                              return { ok: r.ok };
-                            })
+                            void act(
+                              "Approbation DG enregistrée.",
+                              async () => {
+                                const r = await apiApprovePurchaseOrderDg(detail.id);
+                                if (r.ok) setDetail(r.purchaseOrder);
+                                return { ok: r.ok };
+                              },
+                              "po_approved",
+                            )
                           }
                           className="mt-2 rounded-lg bg-emerald-600/80 px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-40"
                         >
@@ -895,10 +973,24 @@ export function PurchaseOrdersPanel({
               {detail.status === "approved" ? (
                 <div className="space-y-3 border-t border-white/10 pt-4">
                   <p className="text-xs text-white/55">
-                    Bon approuvé : vous pouvez réceptionner les marchandises au dépôt. Pour sortir l’argent (caisse ou
-                    banque), enregistrez une <strong className="text-white/70">dépense</strong> au livre de caisse.
+                    Bon approuvé : vous pouvez réceptionner les marchandises au dépôt. Un seul paiement fournisseur peut
+                    être enregistré ici : il crée une <strong className="text-white/70">dépense</strong> au livre de
+                    caisse pour le <strong className="text-white/70">total estimé du bon en CDF</strong> (équivalent USD
+                    affiché à titre indicatif selon le taux des paramètres).
                   </p>
-                  {canCashBook ? (
+                  {detail.supplierPaymentRecordedAt ? (
+                    <p className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100/90">
+                      Paiement fournisseur déjà enregistré le{" "}
+                      <span className="font-medium">{formatPoWhen(detail.supplierPaymentRecordedAt)}</span> —{" "}
+                      {formatPoCdf(detail.estimatedTotalCdf)} CDF
+                      {cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd) != null
+                        ? ` (≈ ${formatPoUsd(cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd)!)} USD)`
+                        : ""}{" "}
+                      (une seule écriture ; livre de caisse en CDF).
+                    </p>
+                  ) : detail.estimatedTotalCdf < 1 ? (
+                    <p className="text-xs text-amber-200/85">Total du bon nul : enregistrement du paiement indisponible.</p>
+                  ) : canCashBook ? (
                     <button
                       type="button"
                       onClick={() => void openSupplierPayment()}
@@ -1021,19 +1113,23 @@ export function PurchaseOrdersPanel({
                 </div>
               ) : null}
               <div className="mt-5 overflow-x-auto">
-                <table className="w-full min-w-[520px] border-collapse text-left text-xs">
+                <table className="w-full min-w-[720px] border-collapse text-left text-xs">
                   <thead>
                     <tr className="border-b border-white/15 text-[10px] font-semibold uppercase tracking-wide text-white/45">
                       <th className="py-2 pr-3">Article</th>
                       <th className="py-2 pr-3">Unité</th>
                       <th className="py-2 pr-3 text-right">Qté</th>
                       <th className="py-2 pr-3 text-right">PU est. (CDF)</th>
-                      <th className="py-2 text-right">Montant (CDF)</th>
+                      <th className="py-2 pr-3 text-right">PU ≈ (USD)</th>
+                      <th className="py-2 pr-3 text-right">Montant (CDF)</th>
+                      <th className="py-2 text-right">Montant ≈ (USD)</th>
                     </tr>
                   </thead>
                   <tbody>
                     {detail.lines.map((l) => {
                       const lineTotal = Math.round(l.qtyOrdered * l.unitCostCdfEst);
+                      const puUsd = cdfToUsd(l.unitCostCdfEst, fxCdfPerUsd);
+                      const lineUsd = cdfToUsd(lineTotal, fxCdfPerUsd);
                       return (
                         <tr key={l.id} className="border-b border-white/5 text-white/80">
                           <td className="py-2 pr-3">
@@ -1047,7 +1143,13 @@ export function PurchaseOrdersPanel({
                           <td className="py-2 pr-3 text-right font-mono tabular-nums">
                             {formatPoCdf(l.unitCostCdfEst)}
                           </td>
-                          <td className="py-2 text-right font-mono tabular-nums">{formatPoCdf(lineTotal)}</td>
+                          <td className="py-2 pr-3 text-right font-mono text-[11px] tabular-nums text-white/50">
+                            {puUsd != null ? formatPoUsd(puUsd) : "—"}
+                          </td>
+                          <td className="py-2 pr-3 text-right font-mono tabular-nums">{formatPoCdf(lineTotal)}</td>
+                          <td className="py-2 text-right font-mono text-[11px] tabular-nums text-white/50">
+                            {lineUsd != null ? formatPoUsd(lineUsd) : "—"}
+                          </td>
                         </tr>
                       );
                     })}
@@ -1058,8 +1160,23 @@ export function PurchaseOrdersPanel({
                 Total estimé :{" "}
                 <span className="font-mono tabular-nums text-brand-cream">{formatPoCdf(detail.estimatedTotalCdf)}</span>{" "}
                 CDF
+                {cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd) != null ? (
+                  <>
+                    {" "}
+                    <span className="text-white/50">·</span> ≈{" "}
+                    <span className="font-mono tabular-nums text-white/75">
+                      {formatPoUsd(cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd)!)}
+                    </span>{" "}
+                    USD
+                  </>
+                ) : null}
               </p>
-              <p className="mt-6 text-[10px] text-white/35">
+              <p className="mt-2 text-right text-[10px] text-white/35">
+                {fxCdfPerUsd != null
+                  ? `Conversion USD indicative : 1 USD = ${formatPoCdf(fxCdfPerUsd)} CDF (paramètres).`
+                  : "Conversion USD : taux indisponible (paramètres)."}
+              </p>
+              <p className="mt-4 text-[10px] text-white/35">
                 Document informatif pour instruction — les montants sont des estimations en CDF avant réception définitive.
               </p>
             </div>
@@ -1084,7 +1201,11 @@ export function PurchaseOrdersPanel({
         </div>
       ) : null}
 
-      {supplierPayOpen && detail && detail.status === "approved" && canCashBook ? (
+      {supplierPayOpen &&
+      detail &&
+      detail.status === "approved" &&
+      !detail.supplierPaymentRecordedAt &&
+      canCashBook ? (
         <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">
           <button
             type="button"
@@ -1118,41 +1239,32 @@ export function PurchaseOrdersPanel({
                 {detail.supplierName}
               </p>
               <p className="text-[11px] text-white/40">
-                Enregistre une <strong className="text-white/55">dépense</strong> sur le compte choisi (même règle que
-                dans le livre de caisse). Montant entier, min. 1.
+                Une seule fois par bon : dépense en <strong className="text-white/55">CDF</strong> pour le total des
+                lignes ({formatPoCdf(detail.estimatedTotalCdf)} CDF
+                {cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd) != null
+                  ? ` · ≈ ${formatPoUsd(cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd)!)} USD`
+                  : ""}
+                ). Compte source en CDF (caisse ou banque).
+                {fxCdfPerUsd != null
+                  ? ` Taux affiché : 1 USD = ${formatPoCdf(fxCdfPerUsd)} CDF.`
+                  : ""}
               </p>
               {payFormErr ? (
                 <p className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-100/90">
                   {payFormErr}
                 </p>
               ) : null}
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div>
-                  <label htmlFor="po-pay-currency" className="mb-1 block text-[10px] font-semibold uppercase text-white/40">
-                    Devise
-                  </label>
-                  <select
-                    id="po-pay-currency"
-                    value={payCurrency}
-                    onChange={(e) => setPayCurrency(e.target.value as "CDF" | "USD")}
-                    className="w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none"
-                  >
-                    <option value="CDF">CDF</option>
-                    <option value="USD">USD</option>
-                  </select>
-                </div>
-                <div>
-                  <label htmlFor="po-pay-date" className="mb-1 block text-[10px] font-semibold uppercase text-white/40">
-                    Date du paiement
-                  </label>
-                  <input
-                    id="po-pay-date"
-                    type="date"
-                    value={payOccurredAt}
-                    onChange={(e) => setPayOccurredAt(e.target.value)}
-                    className="w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none"
-                  />
-                </div>
+              <div>
+                <label htmlFor="po-pay-date" className="mb-1 block text-[10px] font-semibold uppercase text-white/40">
+                  Date du paiement
+                </label>
+                <input
+                  id="po-pay-date"
+                  type="date"
+                  value={payOccurredAt}
+                  onChange={(e) => setPayOccurredAt(e.target.value)}
+                  className="w-full max-w-xs rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none"
+                />
               </div>
               <div>
                 <label htmlFor="po-pay-account" className="mb-1 block text-[10px] font-semibold uppercase text-white/40">
@@ -1167,15 +1279,15 @@ export function PurchaseOrdersPanel({
                   className="w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none disabled:opacity-50"
                 >
                   <option value="">{payAccountsLoading ? "Chargement…" : "— Choisir —"}</option>
-                  {payAccountsForCurrency.map((a) => (
+                  {payAccountsCdf.map((a) => (
                     <option key={a.id} value={a.id}>
                       {a.label} ({a.kind === "physical" ? "caisse" : "banque"})
                     </option>
                   ))}
                 </select>
-                {!payAccountsLoading && payAccountsForCurrency.length === 0 ? (
+                {!payAccountsLoading && payAccountsCdf.length === 0 ? (
                   <p className="mt-1 text-[11px] text-amber-200/80">
-                    Aucun compte actif en {payCurrency}. Créez-en un dans{" "}
+                    Aucun compte actif en CDF. Créez-en un dans{" "}
                     <Link to="/livre-caisse" className="underline">
                       Livre de caisse
                     </Link>
@@ -1183,21 +1295,15 @@ export function PurchaseOrdersPanel({
                   </p>
                 ) : null}
               </div>
-              <div>
-                <label htmlFor="po-pay-amount" className="mb-1 block text-[10px] font-semibold uppercase text-white/40">
-                  Montant ({payCurrency})
-                </label>
-                <input
-                  id="po-pay-amount"
-                  type="text"
-                  inputMode="numeric"
-                  value={payAmountStr}
-                  onChange={(e) => setPayAmountStr(e.target.value)}
-                  className="w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none"
-                />
-                <p className="mt-1 text-[10px] text-white/35">
-                  Total estimé du BC : {formatPoCdf(detail.estimatedTotalCdf)} CDF (ajustez si le paiement réel
-                  diffère).
+              <div className="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
+                <p className="text-[10px] font-semibold uppercase text-white/40">Montant (figé — total du bon)</p>
+                <p className="mt-1 font-mono text-sm tabular-nums text-white/90">
+                  {formatPoCdf(detail.estimatedTotalCdf)} CDF
+                  {cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd) != null ? (
+                    <span className="block text-[11px] font-normal text-white/50">
+                      ≈ {formatPoUsd(cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd)!)} USD (indicatif)
+                    </span>
+                  ) : null}
                 </p>
               </div>
               <div>
@@ -1223,7 +1329,7 @@ export function PurchaseOrdersPanel({
                 </button>
                 <button
                   type="submit"
-                  disabled={paySubmitBusy || payAccountsLoading || payAccountsForCurrency.length === 0}
+                  disabled={paySubmitBusy || payAccountsLoading || payAccountsCdf.length === 0}
                   className="rounded-xl bg-gradient-to-r from-emerald-600 to-emerald-700 px-4 py-2 text-xs font-semibold text-white disabled:opacity-40"
                 >
                   {paySubmitBusy ? "Enregistrement…" : "Valider le paiement"}

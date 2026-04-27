@@ -64,6 +64,8 @@ import { useNavigate, useParams } from "react-router-dom";
 
 type TabId = LogistiqueSectionId;
 
+type SeuilsSubTab = "alertes" | "seuils";
+
 const DOC_LABELS: Record<string, string> = {
   receipt: "Réception (achat)",
   transfer: "Transfert",
@@ -87,7 +89,7 @@ const STOCKS_TAB_HEADER_META: Record<LogistiqueSectionId, { subtitle: string; Ic
     Icon: Package,
   },
   seuils: {
-    subtitle: "Min, max et point de commande par article et lieu ; alertes de stock.",
+    subtitle: "Alertes actives et définition des seuils min, max et point de commande par article et lieu.",
     Icon: SlidersHorizontal,
   },
   "a-commander": {
@@ -147,6 +149,70 @@ function centsToUsdInputString(cents: number): string {
 }
 
 const ARTICLES_LIST_PAGE_SIZE = 10;
+
+function stockAlertKindOrder(kind: string): number {
+  if (kind === "stockout") return 0;
+  if (kind === "overstock") return 1;
+  return 2;
+}
+
+function stockAlertKindShortLabel(kind: string): string {
+  if (kind === "stockout") return "Sous stock min";
+  if (kind === "overstock") return "Sur-stock";
+  if (kind === "reorder") return "Point de commande";
+  return kind;
+}
+
+function stockAlertThresholdCell(a: StockDashboardAlert): string {
+  if (a.kind === "stockout" && a.minQty != null) return `min ${a.minQty}`;
+  if (a.kind === "overstock" && a.maxQty != null) return `plafond ${a.maxQty}`;
+  if (a.kind === "reorder" && a.reorderPoint != null) return `point ${a.reorderPoint}`;
+  return "—";
+}
+
+type StockAlertGroup = {
+  itemId: string;
+  itemCode: string;
+  itemLabel: string;
+  worstKind: string;
+  lines: StockDashboardAlert[];
+};
+
+function groupStockAlertsByItem(alerts: StockDashboardAlert[]): StockAlertGroup[] {
+  const map = new Map<string, StockDashboardAlert[]>();
+  for (const a of alerts) {
+    const list = map.get(a.itemId) ?? [];
+    list.push(a);
+    map.set(a.itemId, list);
+  }
+  const groups: StockAlertGroup[] = [];
+  for (const [, lines] of map) {
+    const sortedLines = [...lines].sort(
+      (a, b) =>
+        stockAlertKindOrder(a.kind) - stockAlertKindOrder(b.kind) ||
+        a.locationLabel.localeCompare(b.locationLabel, "fr"),
+    );
+    let worstKind = sortedLines[0]?.kind ?? "reorder";
+    for (const l of sortedLines) {
+      if (stockAlertKindOrder(l.kind) < stockAlertKindOrder(worstKind)) worstKind = l.kind;
+    }
+    const first = sortedLines[0];
+    if (!first) continue;
+    groups.push({
+      itemId: first.itemId,
+      itemCode: first.itemCode,
+      itemLabel: first.itemLabel,
+      worstKind,
+      lines: sortedLines,
+    });
+  }
+  groups.sort(
+    (a, b) =>
+      stockAlertKindOrder(a.worstKind) - stockAlertKindOrder(b.worstKind) ||
+      a.itemLabel.localeCompare(b.itemLabel, "fr"),
+  );
+  return groups;
+}
 
 export function Stocks() {
   const { user } = useAuth();
@@ -230,12 +296,15 @@ export function Stocks() {
   const [articlesFilterCategory, setArticlesFilterCategory] = useState("");
   const [articlesFilterSubcategory, setArticlesFilterSubcategory] = useState("");
   const [inventoryRefreshTick, setInventoryRefreshTick] = useState(0);
+  const [seuilsSubTab, setSeuilsSubTab] = useState<SeuilsSubTab>("alertes");
 
   const refreshStockThresholdData = useCallback(async () => {
     const [al, ord] = await Promise.all([apiInventoryStockAlerts(), apiInventoryToOrder()]);
     setStockAlerts(al ?? []);
     setToOrderLines(ord?.lines ?? []);
   }, []);
+
+  const stockAlertGroups = useMemo(() => groupStockAlertsByItem(stockAlerts), [stockAlerts]);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -1213,41 +1282,158 @@ export function Stocks() {
 
           {tab === "seuils" ? (
             <div className="rounded-2xl border border-white/10 glass-panel p-6">
-              <h2 className="font-display text-lg text-brand-cream/95">Seuils & alertes</h2>
+              <h2 className="font-display text-lg text-brand-cream/95">Seuils & réappro</h2>
               <p className="mt-1 text-xs text-white/40">
-                Définissez les seuils par article et lieu, puis consultez les alertes lorsque le stock franchit un
-                plancher, un plafond ou le point de commande.
+                {seuilsSubTab === "alertes"
+                  ? "Stocks sous le minimum, au point de commande ou au-dessus du plafond — détail par article et par lieu."
+                  : "Définissez les seuils par article et lieu (min, max, point de commande). Les alertes se mettent à jour après enregistrement."}
               </p>
-              <StockReorderPoliciesPanel
-                items={items}
-                locations={locations}
-                balances={balances}
-                refreshSignal={inventoryRefreshTick}
-                onPoliciesSaved={refreshStockThresholdData}
-              />
-              <div className="mt-10 border-t border-white/10 pt-6">
-                <h3 className="font-display text-base text-brand-cream/95">Alertes actives</h3>
-                <p className="mt-1 text-[11px] text-white/40">
-                  Liste mise à jour après enregistrement des politiques ou actualisation de la page.
-                </p>
-                {stockAlerts.length === 0 ? (
-                  <p className="mt-4 text-sm text-white/45">
-                    Aucune alerte pour l’instant (stock dans les limites ou politiques non déclenchées).
-                  </p>
-                ) : (
-                  <ul className="mt-4 space-y-2 text-sm text-white/75">
-                    {stockAlerts.map((a, i) => (
-                      <li
-                        key={`${a.itemId}-${a.locationId}-${i}`}
-                        className="rounded-lg border border-white/10 bg-black/20 px-3 py-2"
-                      >
-                        <span className="text-[10px] font-semibold uppercase text-white/40">{a.kind}</span>
-                        <p className="mt-1">{a.message}</p>
-                      </li>
-                    ))}
-                  </ul>
-                )}
+              <div
+                className="mt-4 flex w-full max-w-md gap-1 rounded-xl border border-white/10 bg-black/25 p-1"
+                role="tablist"
+                aria-label="Sous-sections seuils et réapprovisionnement"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={seuilsSubTab === "alertes"}
+                  id="seuils-subtab-alertes"
+                  onClick={() => setSeuilsSubTab("alertes")}
+                  className={`flex-1 rounded-lg px-3 py-2 text-center text-xs font-semibold uppercase tracking-wide transition-colors ${
+                    seuilsSubTab === "alertes"
+                      ? "bg-brand-orange/25 text-brand-cream shadow-sm"
+                      : "text-white/45 hover:bg-white/5 hover:text-white/70"
+                  }`}
+                >
+                  Alertes
+                  {stockAlerts.length > 0 ? (
+                    <span className="ml-1.5 rounded-md bg-brand-orange/30 px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-brand-cream">
+                      {stockAlerts.length}
+                    </span>
+                  ) : null}
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={seuilsSubTab === "seuils"}
+                  id="seuils-subtab-seuils"
+                  onClick={() => setSeuilsSubTab("seuils")}
+                  className={`flex-1 rounded-lg px-3 py-2 text-center text-xs font-semibold uppercase tracking-wide transition-colors ${
+                    seuilsSubTab === "seuils"
+                      ? "bg-brand-orange/25 text-brand-cream shadow-sm"
+                      : "text-white/45 hover:bg-white/5 hover:text-white/70"
+                  }`}
+                >
+                  Seuils
+                </button>
               </div>
+
+              {seuilsSubTab === "alertes" ? (
+                <div
+                  className="mt-6"
+                  role="tabpanel"
+                  aria-labelledby="seuils-subtab-alertes"
+                >
+                  <h3 className="sr-only">Alertes actives</h3>
+                  <p className="text-[11px] text-white/40">
+                    Liste mise à jour après enregistrement des politiques ou actualisation de la page.
+                  </p>
+                  {stockAlerts.length === 0 ? (
+                    <p className="mt-4 text-sm text-white/45">
+                      Aucune alerte pour l’instant (stock dans les limites ou politiques non déclenchées).
+                    </p>
+                  ) : (
+                    <div className="mt-4 space-y-3">
+                      <p className="text-xs text-white/45">
+                        {stockAlerts.length} alerte{stockAlerts.length > 1 ? "s" : ""} sur{" "}
+                        {stockAlertGroups.length} article{stockAlertGroups.length > 1 ? "s" : ""} — chaque bloc est
+                        repliable ; le tableau liste les lieux concernés.
+                      </p>
+                      <div className="max-h-[min(55vh,26rem)] space-y-2 overflow-y-auto pr-1">
+                        {stockAlertGroups.map((g) => {
+                          const borderClass =
+                            g.worstKind === "stockout"
+                              ? "border-brand-orange/30"
+                              : g.worstKind === "overstock"
+                                ? "border-amber-500/25"
+                                : "border-white/10";
+                          return (
+                            <details
+                              key={g.itemId}
+                              className={`group rounded-xl border bg-black/25 ${borderClass} open:shadow-[inset_0_1px_0_0_rgba(255,255,255,0.04)]`}
+                            >
+                              <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2.5 text-sm marker:content-none [&::-webkit-details-marker]:hidden">
+                                <ChevronRight className="h-4 w-4 shrink-0 text-white/35 transition-transform group-open:rotate-90" />
+                                <span
+                                  className={`rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                                    g.worstKind === "stockout"
+                                      ? "bg-brand-orange/20 text-brand-orange"
+                                      : g.worstKind === "overstock"
+                                        ? "bg-amber-500/15 text-amber-200/90"
+                                        : "bg-white/10 text-white/60"
+                                  }`}
+                                >
+                                  {stockAlertKindShortLabel(g.worstKind)}
+                                </span>
+                                <span className="font-mono text-white/90">{g.itemCode}</span>
+                                <span className="text-white/55">{g.itemLabel}</span>
+                                <span className="ml-auto text-[11px] text-white/40">
+                                  {g.lines.length} lieu{g.lines.length > 1 ? "x" : ""}
+                                </span>
+                              </summary>
+                              <div className="border-t border-white/5 px-3 pb-3 pt-1">
+                                <div className="overflow-x-auto rounded-lg border border-white/5">
+                                  <table className="w-full min-w-[320px] text-left text-xs">
+                                    <thead className="border-b border-white/10 text-[10px] font-semibold uppercase tracking-wider text-white/35">
+                                      <tr>
+                                        <th className="px-2 py-2">Type</th>
+                                        <th className="px-2 py-2">Lieu</th>
+                                        <th className="px-2 py-2 text-right">Stock</th>
+                                        <th className="px-2 py-2">Seuil</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {g.lines.map((a) => (
+                                        <tr key={`${a.itemId}-${a.locationId}-${a.kind}`} className="border-b border-white/[0.06] last:border-0">
+                                          <td className="px-2 py-1.5 text-white/50">{stockAlertKindShortLabel(a.kind)}</td>
+                                          <td className="px-2 py-1.5 text-white/75">{a.locationLabel}</td>
+                                          <td className="px-2 py-1.5 text-right font-mono text-white/80">
+                                            {a.qty.toLocaleString("fr-FR", { maximumFractionDigits: 3 })}
+                                          </td>
+                                          <td className="px-2 py-1.5 text-white/45">{stockAlertThresholdCell(a)}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            </details>
+                          );
+                        })}
+                      </div>
+                      <p className="text-[11px] text-white/35">
+                        Actions : onglet « À commander » pour les quantités suggérées, ou modifiez les règles dans
+                        l’onglet « Seuils ».
+                      </p>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div
+                  className="mt-6"
+                  role="tabpanel"
+                  aria-labelledby="seuils-subtab-seuils"
+                >
+                  <h3 className="sr-only">Politiques de seuils</h3>
+                  <StockReorderPoliciesPanel
+                    items={items}
+                    locations={locations}
+                    balances={balances}
+                    refreshSignal={inventoryRefreshTick}
+                    onPoliciesSaved={refreshStockThresholdData}
+                  />
+                </div>
+              )}
             </div>
           ) : null}
 

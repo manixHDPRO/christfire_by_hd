@@ -2679,6 +2679,37 @@ export async function apiGetPurchaseOrder(id: string): Promise<PurchaseOrderDeta
   }
 }
 
+/** Paiement fournisseur unique (CDF) : le serveur crée la dépense pour le total des lignes et verrouille le bon. */
+export async function apiRecordPurchaseOrderSupplierPayment(
+  id: string,
+  body: { occurredAt: string; sourceAccountId: string; note?: string },
+): Promise<
+  { ok: true; purchaseOrder: PurchaseOrderDetail; movementId: string } | { ok: false; code: string }
+> {
+  try {
+    const res = await fetch(
+      apiUrl(`/api/inventory/purchase-orders/${encodeURIComponent(id)}/supplier-payment`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(body),
+      },
+    );
+    const data = await parseJson<{
+      purchaseOrder?: PurchaseOrderDetail;
+      movementId?: string;
+      code?: string;
+    }>(res);
+    if (res.status === 201 && data?.purchaseOrder && data?.movementId) {
+      return { ok: true, purchaseOrder: data.purchaseOrder, movementId: data.movementId };
+    }
+    return { ok: false, code: data?.code ?? "error" };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
 export async function apiCreatePurchaseOrder(body: {
   supplierId: string;
   /** Non utilisé : le serveur génère `BC-{année}-{séquence}`. */

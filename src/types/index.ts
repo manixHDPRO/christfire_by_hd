@@ -789,6 +789,8 @@ export interface PurchaseOrderListRow {
   dgApprovedAt: string | null;
   financeReleasedAt: string | null;
   accountingReleasedAt: string | null;
+  /** Si renseigné : un paiement fournisseur unique a été enregistré au livre de caisse (CDF). */
+  supplierPaymentRecordedAt: string | null;
   estimatedTotalCdf: number;
 }
 
@@ -835,6 +837,9 @@ export interface PurchaseOrderDetail {
   rejectedByName: string | null;
   createdByName: string | null;
   estimatedTotalCdf: number;
+  /** Date d’enregistrement du paiement fournisseur unique (livre de caisse, CDF = total des lignes). */
+  supplierPaymentRecordedAt: string | null;
+  supplierPaymentMovementId: string | null;
   lines: PurchaseOrderLineDetail[];
 }
 
