@@ -1,0 +1,74 @@
+/**
+ * Thème clair : surcharge des utilitaires Tailwind les plus utilisés sous .app-mesh
+ * (spécificité + !important pour rester lisible sans retoucher chaque écran).
+ */
+html:not(.dark) .app-mesh .text-white {
+  color: rgb(28 25 23) !important;
+}
+
+html:not(.dark) .app-mesh .text-white\/25 {
+  color: rgb(28 25 23 / 0.25) !important;
+}
+html:not(.dark) .app-mesh .text-white\/30 {
+  color: rgb(28 25 23 / 0.3) !important;
+}
+html:not(.dark) .app-mesh .text-white\/35 {
+  color: rgb(28 25 23 / 0.35) !important;
+}
+html:not(.dark) .app-mesh .text-white\/40 {
+  color: rgb(28 25 23 / 0.58) !important;
+}
+html:not(.dark) .app-mesh .text-white\/45 {
+  color: rgb(28 25 23 / 0.62) !important;
+}
+html:not(.dark) .app-mesh .text-white\/50 {
+  color: rgb(28 25 23 / 0.66) !important;
+}
+html:not(.dark) .app-mesh .text-white\/55 {
+  color: rgb(28 25 23 / 0.55) !important;
+}
+html:not(.dark) .app-mesh .text-white\/60 {
+  color: rgb(28 25 23 / 0.6) !important;
+}
+html:not(.dark) .app-mesh .text-white\/70 {
+  color: rgb(28 25 23 / 0.7) !important;
+}
+html:not(.dark) .app-mesh .text-white\/75 {
+  color: rgb(28 25 23 / 0.75) !important;
+}
+html:not(.dark) .app-mesh .text-white\/80 {
+  color: rgb(28 25 23 / 0.8) !important;
+}
+html:not(.dark) .app-mesh .text-white\/85 {
+  color: rgb(28 25 23 / 0.85) !important;
+}
+html:not(.dark) .app-mesh .text-white\/90 {
+  color: rgb(28 25 23 / 0.9) !important;
+}
+html:not(.dark) .app-mesh .text-white\/95 {
+  color: rgb(28 25 23 / 0.95) !important;
+}
+
+html:not(.dark) .app-mesh .placeholder\:text-white\/25::placeholder {
+  color: rgb(28 25 23 / 0.25) !important;
+}
+html:not(.dark) .app-mesh .placeholder\:text-white\/30::placeholder {
+  color: rgb(28 25 23 / 0.3) !important;
+}
+
+/* Crème (#FFF7D6) sur fond papier clair : illisible → texte pierre foncée */
+html:not(.dark) .app-mesh .text-brand-cream {
+  color: rgb(28 25 23) !important;
+}
+html:not(.dark) .app-mesh .text-brand-cream\/80 {
+  color: rgb(28 25 23 / 0.82) !important;
+}
+html:not(.dark) .app-mesh .text-brand-cream\/90 {
+  color: rgb(28 25 23 / 0.92) !important;
+}
+html:not(.dark) .app-mesh .text-brand-cream\/95 {
+  color: rgb(28 25 23 / 0.95) !important;
+}
+html:not(.dark) .app-mesh .hover\:text-brand-cream:hover {
+  color: rgb(68 20 18) !important;
+}

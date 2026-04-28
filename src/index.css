@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+:root.dark {
+  color-scheme: dark;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "DM Sans", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Fond dynamique — clair : papier chaud ; sombre : braises */
+.app-mesh {
+  background-color: #faf6f0;
+  background-image:
+    radial-gradient(ellipse 120% 80% at 10% 0%, rgba(145, 25, 21, 0.12) 0%, transparent 50%),
+    radial-gradient(ellipse 90% 70% at 90% 20%, rgba(230, 74, 25, 0.08) 0%, transparent 45%),
+    radial-gradient(ellipse 70% 50% at 50% 100%, rgba(249, 168, 37, 0.1) 0%, transparent 40%);
+  background-size: 200% 200%;
+  animation: mesh-drift 18s ease infinite;
+}
+
+.dark .app-mesh {
+  background-color: #1a0a08;
+  background-image:
+    radial-gradient(ellipse 120% 80% at 10% 0%, rgba(145, 25, 21, 0.55) 0%, transparent 50%),
+    radial-gradient(ellipse 90% 70% at 90% 20%, rgba(230, 74, 25, 0.25) 0%, transparent 45%),
+    radial-gradient(ellipse 70% 50% at 50% 100%, rgba(249, 168, 37, 0.12) 0%, transparent 40%);
+}
+
+@keyframes mesh-drift {
+  0%,
+  100% {
+    background-position: 0% 0%;
+  }
+  50% {
+    background-position: 100% 40%;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply border border-stone-200/70 bg-white/80 backdrop-blur-xl shadow-sm shadow-stone-900/5;
+  }
+  .dark .glass-panel {
+    @apply border-white/10 bg-white/[0.04] shadow-none;
+  }
+  .text-gradient-fire {
+    @apply bg-gradient-to-r from-brand-cream via-brand-orange to-brand-red-orange bg-clip-text text-transparent;
+  }
+}
