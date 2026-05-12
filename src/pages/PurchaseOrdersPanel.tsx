@@ -10,8 +10,6 @@ import {
   apiPatchPurchaseOrder,
   apiRecordPurchaseOrderSupplierPayment,
   apiRejectPurchaseOrder,
-  apiReleasePurchaseOrderAccounting,
-  apiReleasePurchaseOrderFinance,
   apiReopenPurchaseOrder,
   apiSubmitPurchaseOrder,
 } from "@/lib/api";
@@ -30,7 +28,8 @@ import { Link } from "react-router-dom";
 const STATUS_FR: Record<string, string> = {
   draft: "Brouillon",
   submitted: "En attente d’approbation",
-  pending_finance: "Attente déblocage finance / compta",
+  pending_payment: "En attente de paiement",
+  pending_finance: "En attente de paiement (ancien flux)",
   approved: "Approuvé",
   rejected: "Refusé",
   closed: "Clôturé (livré)",
@@ -80,8 +79,6 @@ export function PurchaseOrdersPanel({
   /** Aperçu « document » réservé aux profils habilités à viser le BC (Manager ou Direction générale). */
   const canPoApproverPreview = canApproveMgr || canApproveDg;
   const canReject = canApproveMgr || canApproveDg;
-  const canReleaseFin = userHasPermission(user, "logistics.po_release_finance");
-  const canReleaseAcc = userHasPermission(user, "logistics.po_release_accounting");
   const canCashBook = userHasPermission(user, "finance.cash_book");
 
   const [list, setList] = useState<PurchaseOrderListRow[]>([]);
@@ -100,8 +97,6 @@ export function PurchaseOrdersPanel({
   const [newLines, setNewLines] = useState<LineForm[]>([{ itemId: "", qtyOrdered: "1", unitCostCdfEst: "0" }]);
 
   const [rejectNote, setRejectNote] = useState("");
-  const [releaseFinanceDetail, setReleaseFinanceDetail] = useState("");
-  const [releaseAccountingDetail, setReleaseAccountingDetail] = useState("");
 
   const [draftEditNote, setDraftEditNote] = useState("");
   const [draftEditRef, setDraftEditRef] = useState("");
@@ -194,8 +189,13 @@ export function PurchaseOrdersPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [supplierPayOpen]);
 
+  const canRecordSupplierPayment =
+    detail &&
+    (detail.status === "pending_payment" || detail.status === "approved") &&
+    !detail.supplierPaymentRecordedAt;
+
   const openSupplierPayment = useCallback(async () => {
-    if (!detail || detail.status !== "approved" || detail.supplierPaymentRecordedAt) return;
+    if (!detail || !canRecordSupplierPayment) return;
     if (detail.estimatedTotalCdf < 1) {
       setFlash("Le total estimé du bon est nul : impossible d’enregistrer un paiement fournisseur.");
       return;
@@ -209,11 +209,11 @@ export function PurchaseOrdersPanel({
     const acc = await apiListFinanceCashAccounts();
     setPayAccountsLoading(false);
     setPayAccounts(acc ?? []);
-  }, [detail]);
+  }, [detail, canRecordSupplierPayment]);
 
   const submitSupplierPayment = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!detail || detail.status !== "approved" || detail.supplierPaymentRecordedAt) return;
+    if (!detail || !canRecordSupplierPayment) return;
     setPayFormErr(null);
     if (!paySourceId.trim()) {
       setPayFormErr("Choisissez le compte (caisse ou banque) d’où part le paiement.");
@@ -233,7 +233,7 @@ export function PurchaseOrdersPanel({
           : res.code === "zero_total"
             ? "Le total du bon est nul : paiement impossible."
             : res.code === "invalid_status"
-              ? "Le bon n’est pas au statut approuvé."
+              ? "Le bon doit être « en attente de paiement » ou « approuvé » sans paiement déjà enregistré."
               : res.code === "currency_mismatch"
                 ? "Le compte choisi n’est pas en CDF (le paiement BC est en CDF, total des lignes)."
                 : res.code === "unknown_account"
@@ -374,9 +374,10 @@ export function PurchaseOrdersPanel({
       </div>
 
       <p className="text-xs text-white/45">
-        Tout achat doit disposer d’un bon approuvé par le <strong className="text-white/55">Manager</strong> et la{" "}
-        <strong className="text-white/55">Direction générale</strong> (deux signataires distincts). Attribuez les droits
-        correspondants dans Paramètres → Rôles.
+        Tout achat doit être visé par le <strong className="text-white/55">Manager</strong> et la{" "}
+        <strong className="text-white/55">Direction générale</strong> (deux signataires distincts), puis du{" "}
+        <strong className="text-white/55">paiement fournisseur</strong> au livre de caisse avant réception stock.
+        Attribuez les droits dans Paramètres → Rôles.
       </p>
 
       <MessageDialog
@@ -535,6 +536,7 @@ export function PurchaseOrdersPanel({
               <option value="">Tous</option>
               <option value="draft">Brouillon</option>
               <option value="submitted">En attente</option>
+              <option value="pending_payment">En attente de paiement</option>
               <option value="approved">Approuvé</option>
               <option value="rejected">Refusé</option>
               <option value="closed">Clôturé</option>
@@ -564,6 +566,22 @@ export function PurchaseOrdersPanel({
                       {STATUS_FR[row.status] ?? row.status}
                       {row.status === "approved" && row.supplierPaymentRecordedAt ? " · Payé fourn." : ""}
                     </span>
+                    {row.status === "submitted" ? (
+                      <span className="mt-0.5 block text-[10px] leading-tight text-amber-200/75">
+                        Sans visa{" "}
+                        {[
+                          !row.managerApprovedAt ? "Manager" : null,
+                          !row.dgApprovedAt ? "Direction" : null,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ") || "—"}
+                      </span>
+                    ) : null}
+                    {row.status === "pending_payment" ? (
+                      <span className="mt-0.5 block text-[10px] leading-tight text-sky-200/80">
+                        Paiement fournisseur à enregistrer au livre de caisse
+                      </span>
+                    ) : null}
                     {fxCdfPerUsd != null && row.estimatedTotalCdf > 0 && cdfToUsd(row.estimatedTotalCdf, fxCdfPerUsd) != null ? (
                       <span className="mt-0.5 block font-mono text-[10px] text-white/40">
                         ≈ {formatPoUsd(cdfToUsd(row.estimatedTotalCdf, fxCdfPerUsd)!)} USD
@@ -884,103 +902,94 @@ export function PurchaseOrdersPanel({
                 </div>
               ) : null}
 
-              {detail.status === "pending_finance" ? (
+              {detail.status === "pending_payment" ? (
                 <div className="space-y-3 border-t border-white/10 pt-4">
-                  <p className="text-xs text-amber-200/80">
-                    Deux validations distinctes sont requises : <strong>Finance</strong> et <strong>Comptabilité</strong>{" "}
-                    (deux utilisateurs différents). Saisissez le détail du déblocage (réf. fonds, compte, etc.).
+                  <p className="text-xs text-sky-200/85">
+                    Visas Manager et Direction générale enregistrés : le bon est en attente de{" "}
+                    <strong className="text-white/80">paiement fournisseur</strong> au livre de caisse. Après
+                    enregistrement, le statut passe à « approuvé » et la réception stock devient possible.
                   </p>
-                  <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="grid gap-2 text-xs text-white/60 sm:grid-cols-2">
                     <div className="rounded-lg border border-white/10 bg-black/20 p-3">
-                      <p className="text-[11px] font-semibold uppercase text-white/45">Finance</p>
-                      <p className="mt-1 text-xs text-white/60">
-                        {detail.financeReleasedAt
-                          ? `✓ ${detail.financeReleasedByName ?? "—"} · ${detail.financeReleasedAt.slice(0, 16)}`
-                          : "En attente"}
+                      <p className="font-semibold uppercase tracking-wide text-white/40">Manager</p>
+                      <p className="mt-1 text-white/75">
+                        {detail.managerApprovedAt
+                          ? `✓ ${detail.managerApprovedByName ?? "—"} · ${detail.managerApprovedAt.slice(0, 16)}`
+                          : "—"}
                       </p>
-                      {canReleaseFin && !detail.financeReleasedAt ? (
-                        <>
-                          <textarea
-                            value={releaseFinanceDetail}
-                            onChange={(e) => setReleaseFinanceDetail(e.target.value)}
-                            rows={2}
-                            placeholder="Détail obligatoire…"
-                            className="mt-2 w-full resize-none rounded-lg border border-white/15 bg-black/30 px-2 py-2 text-xs text-white outline-none"
-                          />
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() =>
-                              void act("Déblocage finance enregistré.", async () => {
-                                const r = await apiReleasePurchaseOrderFinance(detail.id, releaseFinanceDetail.trim());
-                                if (r.ok) {
-                                  setDetail(r.purchaseOrder);
-                                  setReleaseFinanceDetail("");
-                                }
-                                return { ok: r.ok };
-                              })
-                            }
-                            className="mt-2 rounded-lg bg-amber-600/85 px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-40"
-                          >
-                            Valider (Finance)
-                          </button>
-                        </>
-                      ) : null}
                     </div>
                     <div className="rounded-lg border border-white/10 bg-black/20 p-3">
-                      <p className="text-[11px] font-semibold uppercase text-white/45">Comptabilité</p>
-                      <p className="mt-1 text-xs text-white/60">
-                        {detail.accountingReleasedAt
-                          ? `✓ ${detail.accountingReleasedByName ?? "—"} · ${detail.accountingReleasedAt.slice(0, 16)}`
-                          : "En attente"}
+                      <p className="font-semibold uppercase tracking-wide text-white/40">Direction générale</p>
+                      <p className="mt-1 text-white/75">
+                        {detail.dgApprovedAt
+                          ? `✓ ${detail.dgApprovedByName ?? "—"} · ${detail.dgApprovedAt.slice(0, 16)}`
+                          : "—"}
                       </p>
-                      {canReleaseAcc && !detail.accountingReleasedAt ? (
-                        <>
-                          <textarea
-                            value={releaseAccountingDetail}
-                            onChange={(e) => setReleaseAccountingDetail(e.target.value)}
-                            rows={2}
-                            placeholder="Détail obligatoire…"
-                            className="mt-2 w-full resize-none rounded-lg border border-white/15 bg-black/30 px-2 py-2 text-xs text-white outline-none"
-                          />
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() =>
-                              void act("Déblocage comptabilité enregistré.", async () => {
-                                const r = await apiReleasePurchaseOrderAccounting(
-                                  detail.id,
-                                  releaseAccountingDetail.trim(),
-                                );
-                                if (r.ok) {
-                                  setDetail(r.purchaseOrder);
-                                  setReleaseAccountingDetail("");
-                                }
-                                return { ok: r.ok };
-                              })
-                            }
-                            className="mt-2 rounded-lg bg-amber-600/85 px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-40"
-                          >
-                            Valider (Comptabilité)
-                          </button>
-                        </>
-                      ) : null}
                     </div>
                   </div>
+                  {canReject ? (
+                    <div className="rounded-lg border border-rose-500/20 bg-rose-500/5 p-3">
+                      <p className="text-[11px] font-semibold uppercase text-rose-200/70">Refuser le bon</p>
+                      <textarea
+                        value={rejectNote}
+                        onChange={(e) => setRejectNote(e.target.value)}
+                        rows={2}
+                        placeholder="Motif…"
+                        className="mt-2 w-full resize-none rounded-lg border border-white/15 bg-black/30 px-2 py-2 text-xs text-white outline-none"
+                      />
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() =>
+                          void act("Bon refusé.", async () => {
+                            const r = await apiRejectPurchaseOrder(detail.id, rejectNote);
+                            if (r.ok) {
+                              setDetail(r.purchaseOrder);
+                              setRejectNote("");
+                            }
+                            return { ok: r.ok };
+                          })
+                        }
+                        className="mt-2 rounded-lg border border-rose-400/40 px-3 py-1.5 text-[11px] font-semibold text-rose-200/90 disabled:opacity-40"
+                      >
+                        Refuser
+                      </button>
+                    </div>
+                  ) : null}
+                  {detail.estimatedTotalCdf < 1 ? (
+                    <p className="text-xs text-amber-200/85">Total du bon nul : enregistrement du paiement indisponible.</p>
+                  ) : canCashBook ? (
+                    <button
+                      type="button"
+                      onClick={() => void openSupplierPayment()}
+                      className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-2.5 text-xs font-semibold text-emerald-100/95 hover:bg-emerald-500/20"
+                    >
+                      <Wallet className="h-4 w-4 text-emerald-300/90" aria-hidden />
+                      Enregistrer le paiement fournisseur
+                    </button>
+                  ) : (
+                    <p className="text-xs text-white/40">
+                      Le paiement nécessite le droit{" "}
+                      <span className="font-mono text-white/50">finance.cash_book</span> (livre de caisse).{" "}
+                      <Link to="/livre-caisse" className="text-brand-orange/90 underline hover:text-brand-orange">
+                        Ouvrir le livre de caisse
+                      </Link>
+                    </p>
+                  )}
                 </div>
               ) : null}
 
               {detail.status === "approved" ? (
                 <div className="space-y-3 border-t border-white/10 pt-4">
                   <p className="text-xs text-white/55">
-                    Bon approuvé : vous pouvez réceptionner les marchandises au dépôt. Un seul paiement fournisseur peut
-                    être enregistré ici : il crée une <strong className="text-white/70">dépense</strong> au livre de
-                    caisse pour le <strong className="text-white/70">total estimé du bon en CDF</strong> (équivalent USD
-                    affiché à titre indicatif selon le taux des paramètres).
+                    Bon approuvé : vous pouvez réceptionner les marchandises au dépôt
+                    {detail.supplierPaymentRecordedAt
+                      ? " (paiement fournisseur déjà enregistré)."
+                      : " — enregistrez le paiement fournisseur si ce bon date d’une ancienne procédure."}
                   </p>
                   {detail.supplierPaymentRecordedAt ? (
                     <p className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100/90">
-                      Paiement fournisseur déjà enregistré le{" "}
+                      Paiement fournisseur enregistré le{" "}
                       <span className="font-medium">{formatPoWhen(detail.supplierPaymentRecordedAt)}</span> —{" "}
                       {formatPoCdf(detail.estimatedTotalCdf)} CDF
                       {cdfToUsd(detail.estimatedTotalCdf, fxCdfPerUsd) != null
@@ -1203,7 +1212,7 @@ export function PurchaseOrdersPanel({
 
       {supplierPayOpen &&
       detail &&
-      detail.status === "approved" &&
+      (detail.status === "pending_payment" || detail.status === "approved") &&
       !detail.supplierPaymentRecordedAt &&
       canCashBook ? (
         <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">

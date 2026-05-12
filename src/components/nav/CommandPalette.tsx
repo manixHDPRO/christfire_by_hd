@@ -27,6 +27,7 @@ import {
   Settings2,
   ShoppingBag,
   Sparkles,
+  UtensilsCrossed,
   Users,
   Wallet,
   Wrench,
@@ -55,6 +56,13 @@ const actions: readonly CmdAction[] = [
   { id: "pay", group: "Finance", label: "Paiement & encaissements (réservations)", to: "/paiement", icon: Wallet },
   { id: "inv", group: "Finance", label: "Facturation", to: "/facturation", icon: CreditCard },
   { id: "comptoir", group: "Finance", label: "Vente comptoir (buvette)", to: "/comptoir", icon: ShoppingBag },
+  {
+    id: "service-salle",
+    group: "Finance",
+    label: "Service salle (articles & tables)",
+    to: "/service-salle",
+    icon: UtensilsCrossed,
+  },
   {
     id: "treso",
     group: "Finance",

@@ -413,10 +413,13 @@ export function CounterSales() {
             <table className="w-full text-left text-sm">
               <thead className="border-b border-white/10 text-[10px] font-semibold uppercase tracking-wider text-white/40">
                 <tr>
+                  <th className="whitespace-nowrap px-4 py-3">N° Facture</th>
                   <th className="px-4 py-3">Date / heure</th>
                   <th className="px-4 py-3">Montant</th>
                   <th className="px-4 py-3">Paiement</th>
                   <th className="px-4 py-3">Libellé</th>
+                  <th className="px-4 py-3 text-center">L.</th>
+                  <th className="px-4 py-3">Table</th>
                   <th className="px-4 py-3">Caisse / terrasse</th>
                   <th className="px-4 py-3">Client</th>
                   <th className="px-4 py-3">Caissier</th>
@@ -425,19 +428,22 @@ export function CounterSales() {
               <tbody>
                 {loading ? (
                   <tr>
-                    <td colSpan={7} className="px-4 py-10 text-center text-white/45">
+                    <td colSpan={10} className="px-4 py-10 text-center text-white/45">
                       Chargement…
                     </td>
                   </tr>
                 ) : sales.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-4 py-10 text-center text-white/45">
+                    <td colSpan={10} className="px-4 py-10 text-center text-white/45">
                       Aucune vente pour cette période.
                     </td>
                   </tr>
                 ) : (
                   sales.map((s) => (
                     <tr key={s.id} className="border-b border-white/5 hover:bg-white/[0.02]">
+                      <td className="max-w-[200px] truncate whitespace-nowrap px-4 py-3 font-mono text-xs tabular-nums text-brand-orange/90">
+                        {s.invoiceRef ?? "—"}
+                      </td>
                       <td className="px-4 py-3 whitespace-nowrap text-white/55">
                         {s.createdAt.includes("T") ? s.createdAt.replace("T", " ").slice(0, 19) : s.createdAt}
                       </td>
@@ -451,6 +457,10 @@ export function CounterSales() {
                           <span className="mt-0.5 block text-[11px] text-white/35">{s.note}</span>
                         ) : null}
                       </td>
+                      <td className="px-4 py-3 text-center text-xs tabular-nums text-white/45">
+                        {(s.linesCount ?? 0) > 0 ? s.linesCount : "—"}
+                      </td>
+                      <td className="px-4 py-3 text-white/50">{s.diningTableCode ?? "—"}</td>
                       <td className="px-4 py-3 text-white/50">{s.pointOfSaleLabel ?? "—"}</td>
                       <td className="px-4 py-3 text-white/55">
                         {s.clientId ? (

@@ -102,6 +102,13 @@ export const PERMISSION_CATALOG: readonly PermissionCatalogEntry[] = [
   },
   {
     groupFr: GROUP_CAISSES,
+    code: "sales.floor",
+    labelFr:
+      "Service salle : catalogue articles, tables ; chaque compte ne voit que ses propres ventes (hors trésorerie)",
+    sortOrder: 117,
+  },
+  {
+    groupFr: GROUP_CAISSES,
     code: "finance.treasury",
     labelFr:
       "Trésorerie : création et gestion des caisses (points de vente), rapports journaliers et écarts",

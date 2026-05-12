@@ -182,6 +182,74 @@ export function inventoryRoutes() {
             })),
         });
     });
+    /** Articles proposés à la vente sur ce point de vente (liste blanche). Vide = catalogue global identique à avant. */
+    r.get("/points-of-sale/:posId/catalog", requireAuth, logisticsPerm, (req, res) => {
+        const posId = routeParamId(req.params.posId);
+        if (!posId.trim()) {
+            res.status(400).json({ code: "validation_error" });
+            return;
+        }
+        const ok = db.prepare("SELECT 1 AS x FROM stock_points_of_sale WHERE id = ? AND active = 1").get(posId);
+        if (!ok) {
+            res.status(404).json({ code: "pos_not_found" });
+            return;
+        }
+        const rows = db
+            .prepare("SELECT item_id AS itemId FROM stock_item_point_of_sale WHERE point_of_sale_id = ? ORDER BY item_id ASC")
+            .all(posId);
+        const n = db
+            .prepare("SELECT COUNT(*) AS c FROM stock_item_point_of_sale WHERE point_of_sale_id = ?")
+            .get(posId);
+        const cnt = n ? Number(n.c) : 0;
+        res.json({
+            itemIds: rows.map((r) => r.itemId),
+            catalogRestricted: cnt > 0,
+        });
+    });
+    r.put("/points-of-sale/:posId/catalog", requireAuth, logisticsPerm, (req, res) => {
+        const posId = routeParamId(req.params.posId);
+        if (!posId.trim()) {
+            res.status(400).json({ code: "validation_error" });
+            return;
+        }
+        const schema = z.object({
+            itemIds: z.array(z.string().min(1).max(80)).max(5000),
+        });
+        const parsed = schema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ code: "validation_error" });
+            return;
+        }
+        const posOk = db.prepare("SELECT 1 AS x FROM stock_points_of_sale WHERE id = ? AND active = 1").get(posId);
+        if (!posOk) {
+            res.status(404).json({ code: "pos_not_found" });
+            return;
+        }
+        const uniq = [...new Set(parsed.data.itemIds)];
+        const stmtOk = db.prepare("SELECT 1 AS x FROM stock_items WHERE id = ? AND active = 1 AND sale_price_usd_cents > 0");
+        for (const id of uniq) {
+            if (!stmtOk.get(id)) {
+                res.status(400).json({ code: "invalid_catalog_item", itemId: id });
+                return;
+            }
+        }
+        try {
+            const run = db.transaction(() => {
+                db.prepare("DELETE FROM stock_item_point_of_sale WHERE point_of_sale_id = ?").run(posId);
+                const ins = db.prepare("INSERT INTO stock_item_point_of_sale (item_id, point_of_sale_id) VALUES (?, ?)");
+                for (const itemId of uniq) {
+                    ins.run(itemId, posId);
+                }
+            });
+            run();
+        }
+        catch (e) {
+            console.error(e);
+            res.status(500).json({ code: "update_failed" });
+            return;
+        }
+        res.status(204).end();
+    });
     r.get("/items", requireAuth, stockItemsReaderPerm, (req, res) => {
         const activeOnly = req.query.active !== "0";
         const rows = db

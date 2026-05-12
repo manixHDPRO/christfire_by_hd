@@ -35,7 +35,15 @@ export const ROLE_MATRIX_MENU_LAYOUT: readonly RoleMatrixLayoutSection[] = [
     rows: [
       { key: "fin-pay", submenu: "Encaissements", routeHint: "/paiement", codes: ["finance.payments"] },
       { key: "fin-inv", submenu: "Facturation", routeHint: "/facturation", codes: ["finance.invoices"] },
-      { key: "fin-ctr", submenu: "Vente comptoir", routeHint: "/comptoir", codes: ["finance.counter"] },
+      { key: "fin-ctr", submenu: "Vente comptoir", routeHint: "/comptoir", codes: ["finance.counter", "finance.treasury"] },
+      {
+        key: "fin-srv",
+        submenu: "Service salle",
+        routeHint: "/service-salle",
+        codes: ["sales.floor", "finance.counter", "finance.treasury"],
+        hintFr:
+          "Rôle sur mesure : vente comptoir seul = encaissement des additions sans catalogue (pas cocher service salle ni trésorerie). Serveur / trésorerie : voir la mention Finance.",
+      },
       {
         key: "fin-tre",
         submenu: "Trésorerie",

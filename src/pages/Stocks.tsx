@@ -1,21 +1,25 @@
 import { useAuth } from "@/auth/AuthContext";
 import { Breadcrumb } from "@/components/layout/Breadcrumb";
 import {
+  type InventoryPointOfSale,
   apiInventoryAdjustment,
   apiInventoryArticleRefs,
   apiInventoryBalances,
   apiInventoryCount,
   apiInventoryCreateItem,
   apiInventoryCreateSupplier,
-  apiInventoryUpdateItem,
   apiInventoryDocuments,
+  apiInventoryGetPosCatalog,
   apiInventoryItems,
   apiInventoryLocations,
+  apiInventoryPointsOfSale,
+  apiInventoryPutPosCatalog,
   apiInventoryReceipt,
   apiInventoryStockAlerts,
   apiInventorySuppliers,
   apiInventoryToOrder,
   apiInventoryTransfer,
+  apiInventoryUpdateItem,
   apiListPurchaseOrdersEligibleForReceipt,
 } from "@/lib/api";
 import {
@@ -56,6 +60,7 @@ import {
   RefreshCw,
   ShoppingCart,
   SlidersHorizontal,
+  Store,
   Truck,
   X,
 } from "lucide-react";
@@ -122,10 +127,58 @@ const STOCKS_TAB_HEADER_META: Record<LogistiqueSectionId, { subtitle: string; Ic
   },
 };
 
-type LineQtyCost = { itemId: string; qty: string; unitCostCdf: string };
-type LineQty = { itemId: string; qty: string };
+type LineQtyCost = {
+  itemId: string;
+  qty: string;
+  unitCostCdf: string;
+  /** Saisie aide : nombre de lots / casiers / paquets (optionnel). */
+  packCount: string;
+  /** Saisie aide : unités de stock par « nombre » (ex. bouteilles par casier) — défaut = unitQty fiche article. */
+  unitsPerPack: string;
+};
+type LineQty = {
+  itemId: string;
+  qty: string;
+  packCount: string;
+  unitsPerPack: string;
+};
 type LineDelta = { itemId: string; qtyDelta: string };
 type LineCount = { itemId: string; countedQty: string };
+
+function defaultUnitsPerPackForItem(items: StockItem[], itemId: string): string {
+  if (!itemId.trim()) return "";
+  const it = items.find((x) => x.id === itemId);
+  if (it == null || !Number.isFinite(it.unitQty) || it.unitQty <= 0) return "";
+  return String(it.unitQty);
+}
+
+/** Remplit la quantité « unité de stock » (ex. bouteilles) à partir de Nombre × U./Nombre. */
+function qtyFromPacks(packCount: string, unitsPerPack: string): string | null {
+  const p = Number(packCount.replace(",", ".").replace(/\s/g, ""));
+  const u = Number(unitsPerPack.replace(",", ".").replace(/\s/g, ""));
+  if (!Number.isFinite(p) || !Number.isFinite(u) || p <= 0 || u <= 0) return null;
+  const total = p * u;
+  if (Number.isInteger(total)) return String(total);
+  const r = Math.round(total * 1000) / 1000;
+  return String(r);
+}
+
+/** Met à jour `qty` automatiquement quand Nombre × U./Nombre est valide ; sinon ne change pas `qty`. */
+function lineQtyAfterPackChange<L extends { qty: string; packCount: string; unitsPerPack: string }>(line: L): L {
+  const q = qtyFromPacks(line.packCount, line.unitsPerPack);
+  if (q === null) return line;
+  return { ...line, qty: q };
+}
+
+/** Libellé d’unité de stock (référentiel) pour affichage à côté des lignes réception / transfert. */
+function stockItemUnitLabel(items: StockItem[], itemId: string): string {
+  if (!itemId.trim()) return "";
+  const it = items.find((x) => x.id === itemId);
+  if (!it) return "";
+  const label = it.unitLabel?.trim();
+  if (label) return label;
+  return it.unit.trim() || "—";
+}
 
 function parseUsdInputToCents(raw: string): number | null {
   const t = raw.replace(/\s/g, "").replace(",", ".").trim();
@@ -271,13 +324,17 @@ export function Stocks() {
   const [recPoId, setRecPoId] = useState("");
   const [recRef, setRecRef] = useState("");
   const [recNote, setRecNote] = useState("");
-  const [recLines, setRecLines] = useState<LineQtyCost[]>([{ itemId: "", qty: "1", unitCostCdf: "0" }]);
+  const [recLines, setRecLines] = useState<LineQtyCost[]>([
+    { itemId: "", qty: "1", unitCostCdf: "0", packCount: "", unitsPerPack: "" },
+  ]);
   const [recBusy, setRecBusy] = useState(false);
 
   const [trFrom, setTrFrom] = useState("");
   const [trTo, setTrTo] = useState("");
   const [trNote, setTrNote] = useState("");
-  const [trLines, setTrLines] = useState<LineQty[]>([{ itemId: "", qty: "1" }]);
+  const [trLines, setTrLines] = useState<LineQty[]>([
+    { itemId: "", qty: "1", packCount: "", unitsPerPack: "" },
+  ]);
   const [trBusy, setTrBusy] = useState(false);
 
   const [adjLoc, setAdjLoc] = useState("");
@@ -298,6 +355,52 @@ export function Stocks() {
   const [inventoryRefreshTick, setInventoryRefreshTick] = useState(0);
   const [seuilsSubTab, setSeuilsSubTab] = useState<SeuilsSubTab>("alertes");
 
+  const [inventoryPosList, setInventoryPosList] = useState<InventoryPointOfSale[]>([]);
+  const [posCatalogPosId, setPosCatalogPosId] = useState("");
+  const [posCatalogIds, setPosCatalogIds] = useState<Record<string, boolean>>({});
+  const [posCatalogRestricted, setPosCatalogRestricted] = useState(false);
+  const [posCatalogSearch, setPosCatalogSearch] = useState("");
+  const [posCatalogBusy, setPosCatalogBusy] = useState(false);
+
+  const vendableCatalogItems = useMemo(
+    () =>
+      items.filter((i) => i.active && (i.salePriceUsdCents ?? 0) > 0).sort((a, b) => a.label.localeCompare(b.label, "fr")),
+    [items],
+  );
+
+  const filteredVendableCatalogItems = useMemo(() => {
+    const q = posCatalogSearch.trim().toLowerCase();
+    if (!q) return vendableCatalogItems;
+    return vendableCatalogItems.filter((it) => {
+      const h = [it.code, it.label, it.categoryLabel ?? "", it.subcategoryLabel ?? ""].join(" ").toLowerCase();
+      return h.includes(q);
+    });
+  }, [vendableCatalogItems, posCatalogSearch]);
+
+  const loadPosCatalog = useCallback(async () => {
+    if (!posCatalogPosId.trim()) return;
+    const data = await apiInventoryGetPosCatalog(posCatalogPosId);
+    if (!data) {
+      setFlash("Impossible de charger le catalogue du point de vente.");
+      return;
+    }
+    setPosCatalogRestricted(data.catalogRestricted);
+    const m: Record<string, boolean> = {};
+    for (const id of data.itemIds) m[id] = true;
+    setPosCatalogIds(m);
+  }, [posCatalogPosId]);
+
+  useEffect(() => {
+    if (inventoryPosList.length > 0 && !posCatalogPosId) {
+      setPosCatalogPosId(inventoryPosList.find((p) => p.isMain)?.id ?? inventoryPosList[0].id);
+    }
+  }, [inventoryPosList, posCatalogPosId]);
+
+  useEffect(() => {
+    if (tab !== "articles" || !posCatalogPosId) return;
+    void loadPosCatalog();
+  }, [tab, posCatalogPosId, inventoryRefreshTick, loadPosCatalog]);
+
   const refreshStockThresholdData = useCallback(async () => {
     const [al, ord] = await Promise.all([apiInventoryStockAlerts(), apiInventoryToOrder()]);
     setStockAlerts(al ?? []);
@@ -309,7 +412,7 @@ export function Stocks() {
   const reload = useCallback(async () => {
     setLoading(true);
     setErr(null);
-    const [loc, it, bal, sup, doc, eli, refs] = await Promise.all([
+    const [loc, it, bal, sup, doc, eli, refs, posRows] = await Promise.all([
       apiInventoryLocations(),
       apiInventoryItems(true),
       apiInventoryBalances(),
@@ -317,7 +420,9 @@ export function Stocks() {
       apiInventoryDocuments(50),
       apiListPurchaseOrdersEligibleForReceipt(),
       apiInventoryArticleRefs(),
+      apiInventoryPointsOfSale(),
     ]);
+    setInventoryPosList(posRows ?? []);
     setLoading(false);
     if (!loc || !it || bal === null || !sup || doc === null || eli === null) {
       setErr("Impossible de charger les données stocks (droits ou serveur).");
@@ -373,7 +478,7 @@ export function Stocks() {
 
   useEffect(() => {
     if (!recPoId) {
-      setRecLines([{ itemId: "", qty: "1", unitCostCdf: "0" }]);
+      setRecLines([{ itemId: "", qty: "1", unitCostCdf: "0", packCount: "", unitsPerPack: "" }]);
       return;
     }
     const po = eligibleReceiptPos.find((p) => p.id === recPoId);
@@ -383,8 +488,11 @@ export function Stocks() {
         itemId: ln.itemId,
         qty: String(ln.qtyRemaining),
         unitCostCdf: String(ln.unitCostCdfEst),
+        packCount: "",
+        unitsPerPack: defaultUnitsPerPackForItem(items, ln.itemId),
       })),
     );
+    // Ne pas dépendre de `items` : évite d’écraser les lignes en cours à chaque rechargement du catalogue.
   }, [recPoId, eligibleReceiptPos]);
 
   const filteredBalances = useMemo(() => {
@@ -681,7 +789,7 @@ export function Stocks() {
       return;
     }
     setFlash(`Réception enregistrée (${res.documentId.slice(0, 8)}…).`);
-    setRecLines([{ itemId: "", qty: "1", unitCostCdf: "0" }]);
+    setRecLines([{ itemId: "", qty: "1", unitCostCdf: "0", packCount: "", unitsPerPack: "" }]);
     setRecRef("");
     setRecNote("");
     await reload();
@@ -723,7 +831,7 @@ export function Stocks() {
       return;
     }
     setFlash("Transfert enregistré.");
-    setTrLines([{ itemId: "", qty: "1" }]);
+    setTrLines([{ itemId: "", qty: "1", packCount: "", unitsPerPack: "" }]);
     setTrNote("");
     await reload();
   };
@@ -797,6 +905,33 @@ export function Stocks() {
     setInvLines([{ itemId: "", countedQty: "0" }]);
     setInvNote("");
     await reload();
+  };
+
+  const submitPosCatalog = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!posCatalogPosId.trim()) return;
+    setPosCatalogBusy(true);
+    setFlash(null);
+    const ids = Object.entries(posCatalogIds)
+      .filter(([, v]) => v)
+      .map(([k]) => k);
+    const res = await apiInventoryPutPosCatalog(posCatalogPosId, { itemIds: ids });
+    setPosCatalogBusy(false);
+    if (!res.ok) {
+      setFlash(
+        res.code === "invalid_catalog_item"
+          ? `Article refusé : vérifiez qu’il est actif avec un prix de vente USD > 0 (${res.itemId ?? ""}).`
+          : "Enregistrement du catalogue refusé.",
+      );
+      return;
+    }
+    setFlash(
+      ids.length === 0
+        ? "Catalogue « tous les articles à prix » pour ce point de vente (liste dédiée effacée)."
+        : "Catalogue de ce point de vente enregistré.",
+    );
+    await loadPosCatalog();
+    setInventoryRefreshTick((t) => t + 1);
   };
 
   return (
@@ -902,6 +1037,7 @@ export function Stocks() {
           ) : null}
 
           {tab === "articles" ? (
+            <div className="space-y-8">
             <div className="grid gap-8 lg:grid-cols-[minmax(0,360px)_1fr]">
               <motion.form
                 onSubmit={submitItem}
@@ -1207,6 +1343,167 @@ export function Stocks() {
               </div>
               </div>
             </div>
+
+            <motion.div
+              layout
+              className="rounded-2xl border border-white/10 glass-panel p-6"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+            >
+              <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="font-display flex items-center gap-2 text-lg text-brand-cream/95">
+                    <Store className="h-5 w-5 shrink-0 text-brand-orange/90" aria-hidden />
+                    Catalogue vendable au service (par terrasse / caisse)
+                  </h2>
+                  <p className="mt-1 max-w-3xl text-xs text-white/40">
+                    Tant qu’aucune liste n’est enregistrée pour un point de vente, le catalogue du service affiche tous les
+                    articles actifs avec prix USD. Dès que vous enregistrez au moins un article pour une terrasse, seuls ces
+                    articles y sont proposés. Enregistrer une liste vide remet le comportement « tout le catalogue » pour ce
+                    point de vente.
+                  </p>
+                </div>
+              </div>
+
+              {inventoryPosList.length === 0 ? (
+                <p className="text-sm text-amber-200/85">
+                  Aucun point de vente actif trouvé. Vérifiez les caisses / terrasses en base.
+                </p>
+              ) : (
+                <form onSubmit={submitPosCatalog} className="space-y-4">
+                  <div className="flex flex-wrap items-end gap-3">
+                    <div className="min-w-[220px] flex-1">
+                      <label
+                        htmlFor="pos-catalog-pos"
+                        className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-white/40"
+                      >
+                        Point de vente
+                      </label>
+                      <select
+                        id="pos-catalog-pos"
+                        value={posCatalogPosId}
+                        onChange={(e) => {
+                          setPosCatalogPosId(e.target.value);
+                          setPosCatalogIds({});
+                        }}
+                        className="w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
+                      >
+                        {inventoryPosList.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label} ({p.code})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="min-w-[200px] flex-1">
+                      <label
+                        htmlFor="pos-catalog-search"
+                        className="mb-1 block text-[10px] font-semibold uppercase tracking-wider text-white/40"
+                      >
+                        Filtrer la liste
+                      </label>
+                      <input
+                        id="pos-catalog-search"
+                        type="search"
+                        value={posCatalogSearch}
+                        onChange={(e) => setPosCatalogSearch(e.target.value)}
+                        placeholder="Code, libellé…"
+                        autoComplete="off"
+                        className="w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none placeholder:text-white/35 focus:ring-2 focus:ring-brand-orange/40"
+                      />
+                    </div>
+                  </div>
+
+                  {!posCatalogRestricted && Object.keys(posCatalogIds).filter((k) => posCatalogIds[k]).length === 0 ? (
+                    <p className="rounded-lg border border-white/10 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100/90">
+                      Liste non restreinte pour ce point de vente : le service voit l’ensemble du catalogue à prix (comportement
+                      par défaut).
+                    </p>
+                  ) : null}
+                  {posCatalogRestricted ? (
+                    <p className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-100/95">
+                      Catalogue restreint : seules les lignes cochées sont servies sur ce point de vente. Pour revenir au
+                      catalogue complet, décochez tout et enregistrez une liste vide.
+                    </p>
+                  ) : null}
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPosCatalogIds((prev) => {
+                          const next = { ...prev };
+                          for (const it of filteredVendableCatalogItems) next[it.id] = true;
+                          return next;
+                        });
+                      }}
+                      className="rounded-lg border border-white/15 px-3 py-1.5 text-xs font-medium text-white/80 hover:bg-white/5"
+                    >
+                      Tout cocher (vue filtrée)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPosCatalogIds((prev) => {
+                          const next = { ...prev };
+                          for (const it of filteredVendableCatalogItems) next[it.id] = false;
+                          return next;
+                        });
+                      }}
+                      className="rounded-lg border border-white/15 px-3 py-1.5 text-xs font-medium text-white/80 hover:bg-white/5"
+                    >
+                      Tout décocher (vue filtrée)
+                    </button>
+                  </div>
+
+                  <div className="max-h-[min(52vh,420px)] space-y-1.5 overflow-auto rounded-xl border border-white/10 bg-black/25 p-3">
+                    {filteredVendableCatalogItems.length === 0 ? (
+                      <p className="py-6 text-center text-sm text-white/40">
+                        Aucun article vendable (actif avec prix USD). Créez-en dans le tableau ci-dessus.
+                      </p>
+                    ) : (
+                      filteredVendableCatalogItems.map((it) => (
+                        <label
+                          key={it.id}
+                          className="flex cursor-pointer items-start gap-3 rounded-lg border border-transparent px-2 py-1.5 hover:border-white/10 hover:bg-white/[0.04]"
+                        >
+                          <input
+                            type="checkbox"
+                            className="mt-1 h-4 w-4 rounded border-white/25 bg-black/40 text-brand-orange focus:ring-brand-orange/40"
+                            checked={!!posCatalogIds[it.id]}
+                            onChange={(e) => {
+                              const on = e.target.checked;
+                              setPosCatalogIds((prev) => ({ ...prev, [it.id]: on }));
+                            }}
+                          />
+                          <span className="min-w-0 text-sm">
+                            <span className="font-mono text-xs text-white/50">{it.code}</span>{" "}
+                            <span className="text-white/85">{it.label}</span>
+                            <span className="text-white/35"> · {it.categoryLabel ?? it.category}</span>
+                          </span>
+                        </label>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="submit"
+                      disabled={posCatalogBusy || !posCatalogPosId}
+                      className="rounded-xl bg-gradient-to-r from-brand-red to-brand-red-orange px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
+                    >
+                      {posCatalogBusy ? "…" : "Enregistrer le catalogue de ce point de vente"}
+                    </button>
+                    <span className="text-[11px] text-white/35">
+                      {Object.entries(posCatalogIds).filter(([, v]) => v).length} article
+                      {Object.entries(posCatalogIds).filter(([, v]) => v).length !== 1 ? "s" : ""} sélectionné
+                      {Object.entries(posCatalogIds).filter(([, v]) => v).length !== 1 ? "s" : ""}
+                    </span>
+                  </div>
+                </form>
+              )}
+            </motion.div>
+            </div>
           ) : null}
 
           {tab === "fournisseurs" ? (
@@ -1487,7 +1784,10 @@ export function Stocks() {
               <h2 className="font-display text-lg text-brand-cream/95">Réception au dépôt central</h2>
               <p className="mt-1 text-xs text-white/40">
                 Réception liée à un <strong className="text-white/50">bon de commande approuvé</strong> : les quantités
-                augmentent le dépôt ; le CMP article est recalculé (coût moyen pondéré).
+                augmentent le dépôt ; le CMP article est recalculé (coût moyen pondéré). La{" "}
+                <strong className="text-white/50">Qté stock</strong> se met à jour{" "}
+                <strong className="text-white/50">automatiquement</strong> (NOMBRE × U./NOMBRE) ; vous pouvez encore la
+                corriger à la main si besoin.
               </p>
               <div className="mt-4 grid gap-4 sm:grid-cols-2">
                 <div>
@@ -1525,14 +1825,22 @@ export function Stocks() {
                   className="w-full resize-none rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
                 />
               </div>
-              <div className="mt-4 space-y-2">
+              <div className="mt-4 space-y-3">
                 {recLines.map((ln, i) => (
-                  <div key={i} className="flex flex-wrap items-end gap-2">
+                  <div
+                    key={i}
+                    className="flex flex-col gap-2 rounded-xl border border-white/10 bg-black/15 p-3 sm:flex-row sm:flex-wrap sm:items-end"
+                  >
                     <select
                       value={ln.itemId}
                       onChange={(e) => {
+                        const id = e.target.value;
                         const next = [...recLines];
-                        next[i] = { ...ln, itemId: e.target.value };
+                        next[i] = lineQtyAfterPackChange({
+                          ...ln,
+                          itemId: id,
+                          unitsPerPack: defaultUnitsPerPackForItem(items, id),
+                        });
                         setRecLines(next);
                       }}
                       className="min-w-[200px] flex-1 rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
@@ -1544,35 +1852,103 @@ export function Stocks() {
                         </option>
                       ))}
                     </select>
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      value={ln.qty}
-                      onChange={(e) => {
-                        const next = [...recLines];
-                        next[i] = { ...ln, qty: e.target.value };
-                        setRecLines(next);
-                      }}
-                      placeholder="Qté"
-                      className="w-24 rounded-xl border border-white/15 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
-                    />
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      value={ln.unitCostCdf}
-                      onChange={(e) => {
-                        const next = [...recLines];
-                        next[i] = { ...ln, unitCostCdf: e.target.value };
-                        setRecLines(next);
-                      }}
-                      placeholder="Coût u. CDF"
-                      className="w-32 rounded-xl border border-white/15 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
-                    />
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      {ln.itemId ? (
+                        <div className="shrink-0">
+                          <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                            Unité
+                          </label>
+                          <div
+                            className="flex min-h-[2.5rem] min-w-[4.75rem] max-w-[9rem] items-center rounded-xl border border-white/15 bg-black/25 px-2.5 py-2 text-xs font-medium leading-tight text-brand-cream/90"
+                            title="Unité de stock de l’article (Qté / coût unitaire)"
+                          >
+                            <span className="line-clamp-2">{stockItemUnitLabel(items, ln.itemId)}</span>
+                          </div>
+                        </div>
+                      ) : null}
+                      <div>
+                        <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                          NOMBRE
+                        </label>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={ln.packCount}
+                          onChange={(e) => {
+                            const next = [...recLines];
+                            next[i] = lineQtyAfterPackChange({ ...ln, packCount: e.target.value });
+                            setRecLines(next);
+                          }}
+                          placeholder="0"
+                          className="w-[4.25rem] rounded-xl border border-white/15 bg-black/30 px-2 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
+                        />
+                      </div>
+                      <span className="pb-2 text-sm text-white/45">×</span>
+                      <div>
+                        <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                          U./NOMBRE
+                        </label>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={ln.unitsPerPack}
+                          onChange={(e) => {
+                            const next = [...recLines];
+                            next[i] = lineQtyAfterPackChange({ ...ln, unitsPerPack: e.target.value });
+                            setRecLines(next);
+                          }}
+                          placeholder="24"
+                          title="Unités de stock par NOMBRE (casier, carton, lot — souvent = conditionnement fiche article)"
+                          className="w-[4.25rem] rounded-xl border border-white/15 bg-black/30 px-2 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-end gap-2">
+                      <div>
+                        <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                          Qté stock
+                        </label>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={ln.qty}
+                          onChange={(e) => {
+                            const next = [...recLines];
+                            next[i] = { ...ln, qty: e.target.value };
+                            setRecLines(next);
+                          }}
+                          placeholder="Qté"
+                          className="w-24 rounded-xl border border-white/15 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                          Coût u. CDF
+                        </label>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          value={ln.unitCostCdf}
+                          onChange={(e) => {
+                            const next = [...recLines];
+                            next[i] = { ...ln, unitCostCdf: e.target.value };
+                            setRecLines(next);
+                          }}
+                          placeholder="0"
+                          className="w-32 rounded-xl border border-white/15 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
+                        />
+                      </div>
+                    </div>
                   </div>
                 ))}
                 <button
                   type="button"
-                  onClick={() => setRecLines([...recLines, { itemId: "", qty: "1", unitCostCdf: "0" }])}
+                  onClick={() =>
+                    setRecLines([
+                      ...recLines,
+                      { itemId: "", qty: "1", unitCostCdf: "0", packCount: "", unitsPerPack: "" },
+                    ])
+                  }
                   className="inline-flex items-center gap-1 rounded-lg border border-white/15 px-3 py-1.5 text-xs text-white/60 hover:bg-white/5"
                 >
                   <Plus className="h-3.5 w-3.5" /> Ligne
@@ -1591,7 +1967,11 @@ export function Stocks() {
           {tab === "transfert" ? (
             <form onSubmit={submitTransfer} className="rounded-2xl border border-white/10 glass-panel p-6">
               <h2 className="font-display text-lg text-brand-cream/95">Transfert entre emplacements</h2>
-              <p className="mt-1 text-xs text-white/40">Typiquement : dépôt → terrasse ou restaurant.</p>
+              <p className="mt-1 text-xs text-white/40">
+                Typiquement : dépôt → terrasse ou restaurant. La <strong className="text-white/50">Qté stock</strong>{" "}
+                (unité de consommation, ex. bouteilles) se calcule <strong className="text-white/50">automatiquement</strong>{" "}
+                dès NOMBRE × U./NOMBRE ; ajustement manuel possible.
+              </p>
               <div className="mt-4 grid gap-4 sm:grid-cols-2">
                 <div>
                   <label className="mb-1 block text-[10px] font-semibold uppercase text-white/40">Origine</label>
@@ -1631,14 +2011,22 @@ export function Stocks() {
                   className="w-full resize-none rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
                 />
               </div>
-              <div className="mt-4 space-y-2">
+              <div className="mt-4 space-y-3">
                 {trLines.map((ln, i) => (
-                  <div key={i} className="flex flex-wrap items-end gap-2">
+                  <div
+                    key={i}
+                    className="flex flex-col gap-2 rounded-xl border border-white/10 bg-black/15 p-3 sm:flex-row sm:flex-wrap sm:items-end"
+                  >
                     <select
                       value={ln.itemId}
                       onChange={(e) => {
+                        const id = e.target.value;
                         const next = [...trLines];
-                        next[i] = { ...ln, itemId: e.target.value };
+                        next[i] = lineQtyAfterPackChange({
+                          ...ln,
+                          itemId: id,
+                          unitsPerPack: defaultUnitsPerPackForItem(items, id),
+                        });
                         setTrLines(next);
                       }}
                       className="min-w-[220px] flex-1 rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
@@ -1650,23 +2038,81 @@ export function Stocks() {
                         </option>
                       ))}
                     </select>
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      value={ln.qty}
-                      onChange={(e) => {
-                        const next = [...trLines];
-                        next[i] = { ...ln, qty: e.target.value };
-                        setTrLines(next);
-                      }}
-                      placeholder="Qté"
-                      className="w-28 rounded-xl border border-white/15 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
-                    />
+                    <div className="flex flex-wrap items-end gap-1.5">
+                      {ln.itemId ? (
+                        <div className="shrink-0">
+                          <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                            Unité
+                          </label>
+                          <div
+                            className="flex min-h-[2.5rem] min-w-[4.75rem] max-w-[9rem] items-center rounded-xl border border-white/15 bg-black/25 px-2.5 py-2 text-xs font-medium leading-tight text-brand-cream/90"
+                            title="Unité de stock de l’article"
+                          >
+                            <span className="line-clamp-2">{stockItemUnitLabel(items, ln.itemId)}</span>
+                          </div>
+                        </div>
+                      ) : null}
+                      <div>
+                        <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                          NOMBRE
+                        </label>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={ln.packCount}
+                          onChange={(e) => {
+                            const next = [...trLines];
+                            next[i] = lineQtyAfterPackChange({ ...ln, packCount: e.target.value });
+                            setTrLines(next);
+                          }}
+                          placeholder="0"
+                          className="w-[4.25rem] rounded-xl border border-white/15 bg-black/30 px-2 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
+                        />
+                      </div>
+                      <span className="pb-2 text-sm text-white/45">×</span>
+                      <div>
+                        <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                          U./NOMBRE
+                        </label>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={ln.unitsPerPack}
+                          onChange={(e) => {
+                            const next = [...trLines];
+                            next[i] = lineQtyAfterPackChange({ ...ln, unitsPerPack: e.target.value });
+                            setTrLines(next);
+                          }}
+                          placeholder="24"
+                          title="Unités de stock par NOMBRE (casier, carton, lot — souvent = conditionnement fiche article)"
+                          className="w-[4.25rem] rounded-xl border border-white/15 bg-black/30 px-2 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="mb-0.5 block text-[9px] font-semibold uppercase tracking-wide text-white/35">
+                        Qté stock
+                      </label>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={ln.qty}
+                        onChange={(e) => {
+                          const next = [...trLines];
+                          next[i] = { ...ln, qty: e.target.value };
+                          setTrLines(next);
+                        }}
+                        placeholder="Qté"
+                        className="w-28 rounded-xl border border-white/15 bg-black/30 px-3 py-2 font-mono text-sm text-white outline-none focus:ring-2 focus:ring-brand-orange/40"
+                      />
+                    </div>
                   </div>
                 ))}
                 <button
                   type="button"
-                  onClick={() => setTrLines([...trLines, { itemId: "", qty: "1" }])}
+                  onClick={() =>
+                    setTrLines([...trLines, { itemId: "", qty: "1", packCount: "", unitsPerPack: "" }])
+                  }
                   className="inline-flex items-center gap-1 rounded-lg border border-white/15 px-3 py-1.5 text-xs text-white/60 hover:bg-white/5"
                 >
                   <Plus className="h-3.5 w-3.5" /> Ligne

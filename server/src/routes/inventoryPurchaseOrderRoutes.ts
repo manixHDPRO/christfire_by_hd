@@ -10,12 +10,10 @@ import { requireAuth } from "../middleware/requireAuth.js";
 import { requireAnyPermission } from "../middleware/requirePermission.js";
 import { roleHasPermission } from "../permissions.js";
 const logisticsPerm = requireAnyPermission("logistics.inventory");
-const poReaderPerm = requireAnyPermission("logistics.inventory", "logistics.po_approve_manager", "logistics.po_approve_dg", "logistics.po_release_finance", "logistics.po_release_accounting");
+const poReaderPerm = requireAnyPermission("logistics.inventory", "logistics.po_approve_manager", "logistics.po_approve_dg");
 const approveManagerPerm = requireAnyPermission("logistics.po_approve_manager");
 const approveDgPerm = requireAnyPermission("logistics.po_approve_dg");
 const approverLinesPerm = requireAnyPermission("logistics.po_approve_manager", "logistics.po_approve_dg");
-const releaseFinancePerm = requireAnyPermission("logistics.po_release_finance");
-const releaseAccountingPerm = requireAnyPermission("logistics.po_release_accounting");
 const cashBookPerm = requireAnyPermission("finance.cash_book");
 function requireRejectPurchaseOrder(req, res, next) {
     const role = req.auth?.role;
@@ -34,9 +32,6 @@ const poLineSchema = z.object({
     itemId: z.string().min(1).max(80),
     qtyOrdered: z.number().positive(),
     unitCostCdfEst: z.number().int().min(0).max(999_999_999).optional().default(0),
-});
-const releaseFundingBodySchema = z.object({
-    fundingDetail: z.string().max(500),
 });
 function assertSupplierActive(id) {
     return !!db.prepare("SELECT 1 FROM stock_suppliers WHERE id = ? AND active = 1").get(id);
@@ -67,8 +62,8 @@ function generateNextPurchaseOrderExternalRef() {
     }
     return `${prefix}${String(max + 1).padStart(4, "0")}`;
 }
-/** Lorsque Manager et DG ont tous deux visé (ordre quelconque) : attente déblocage Finance + Compta. */
-function syncPoToPendingFinanceIfBothApproved(poId) {
+/** Lorsque Manager et DG ont tous deux visé (ordre quelconque) : en attente de paiement livre de caisse. */
+function syncPoToPendingPaymentIfBothApproved(poId) {
     const row = db
         .prepare(`SELECT manager_approved_by_user_id AS m, dg_approved_by_user_id AS d, status
        FROM stock_purchase_orders WHERE id = ?`)
@@ -77,20 +72,7 @@ function syncPoToPendingFinanceIfBothApproved(poId) {
         return;
     if (row.status !== "submitted")
         return;
-    db.prepare(`UPDATE stock_purchase_orders SET status = 'pending_finance' WHERE id = ?`).run(poId);
-}
-function trySetPoFullyApprovedAfterFinanceReleases(poId) {
-    const row = db
-        .prepare(`SELECT status,
-        finance_released_by_user_id AS f,
-        accounting_released_by_user_id AS a
-       FROM stock_purchase_orders WHERE id = ?`)
-        .get(poId);
-    if (!row || row.status !== "pending_finance")
-        return;
-    if (!row.f || !row.a || row.f === row.a)
-        return;
-    db.prepare(`UPDATE stock_purchase_orders SET status = 'approved' WHERE id = ? AND status = 'pending_finance'`).run(poId);
+    db.prepare(`UPDATE stock_purchase_orders SET status = 'pending_payment' WHERE id = ?`).run(poId);
 }
 function loadPoDetail(poId) {
     const po = db
@@ -164,7 +146,8 @@ export function inventoryPurchaseOrderRoutes() {
         const status = typeof req.query.status === "string" ? req.query.status.trim() : "";
         const conds = ["1=1"];
         const params = [];
-        if (status && ["draft", "submitted", "pending_finance", "approved", "rejected", "closed"].includes(status)) {
+        if (status &&
+            ["draft", "submitted", "pending_payment", "approved", "rejected", "closed"].includes(status)) {
             conds.push("p.status = ?");
             params.push(status);
         }
@@ -243,7 +226,7 @@ export function inventoryPurchaseOrderRoutes() {
                 .get(pid);
             if (!row)
                 return { type: "not_found" };
-            if (row.status !== "approved")
+            if (row.status !== "approved" && row.status !== "pending_payment")
                 return { type: "invalid_status" };
             if (row.spr)
                 return { type: "already_paid" };
@@ -270,10 +253,12 @@ export function inventoryPurchaseOrderRoutes() {
             });
             if (!ins.ok)
                 return { type: "finance", fin: ins };
+            const pendingPay = row.status === "pending_payment";
             const u = db
                 .prepare(`UPDATE stock_purchase_orders
          SET supplier_payment_recorded_at = datetime('now'),
              supplier_payment_movement_id = @mid
+             ${pendingPay ? ", status = 'approved'" : ""}
          WHERE id = @id AND supplier_payment_recorded_at IS NULL`)
                 .run({ mid: ins.id, id: pid });
             if (u.changes !== 1) {
@@ -430,7 +415,7 @@ export function inventoryPurchaseOrderRoutes() {
             res.status(404).json({ code: "not_found" });
             return;
         }
-        if (row.status !== "submitted" && row.status !== "pending_finance") {
+        if (row.status !== "submitted" && row.status !== "pending_payment") {
             res.status(400).json({ code: "invalid_status" });
             return;
         }
@@ -537,7 +522,7 @@ export function inventoryPurchaseOrderRoutes() {
             return;
         }
         db.prepare(`UPDATE stock_purchase_orders SET manager_approved_by_user_id = ?, manager_approved_at = datetime('now') WHERE id = ?`).run(userId, poId);
-        syncPoToPendingFinanceIfBothApproved(poId);
+        syncPoToPendingPaymentIfBothApproved(poId);
         res.json({ purchaseOrder: loadPoDetail(poId) });
     });
     r.post("/purchase-orders/:id/approve-dg", requireAuth, approveDgPerm, (req, res) => {
@@ -567,92 +552,20 @@ export function inventoryPurchaseOrderRoutes() {
             return;
         }
         db.prepare(`UPDATE stock_purchase_orders SET dg_approved_by_user_id = ?, dg_approved_at = datetime('now') WHERE id = ?`).run(userId, poId);
-        syncPoToPendingFinanceIfBothApproved(poId);
+        syncPoToPendingPaymentIfBothApproved(poId);
         res.json({ purchaseOrder: loadPoDetail(poId) });
     });
-    r.post("/purchase-orders/:id/release-finance", requireAuth, releaseFinancePerm, (req, res) => {
-        const poId = routeParamId(req.params.id);
-        const userId = req.auth?.sub;
-        if (!userId) {
-            res.status(401).json({ code: "unauthorized" });
-            return;
-        }
-        const bodyParsed = releaseFundingBodySchema.safeParse(req.body ?? {});
-        if (!bodyParsed.success) {
-            res.status(400).json({ code: "validation_error" });
-            return;
-        }
-        const fundingDetail = bodyParsed.data.fundingDetail.trim();
-        if (!fundingDetail) {
-            res.status(400).json({ code: "funding_detail_required" });
-            return;
-        }
-        const row = db
-            .prepare(`SELECT status, finance_released_by_user_id AS f, accounting_released_by_user_id AS a
-         FROM stock_purchase_orders WHERE id = ?`)
-            .get(poId);
-        if (!row) {
-            res.status(404).json({ code: "not_found" });
-            return;
-        }
-        if (row.status !== "pending_finance") {
-            res.status(400).json({ code: "invalid_status" });
-            return;
-        }
-        if (row.f) {
-            res.status(400).json({ code: "already_released" });
-            return;
-        }
-        if (row.a === userId) {
-            res.status(400).json({ code: "same_releaser" });
-            return;
-        }
-        db.prepare(`UPDATE stock_purchase_orders SET finance_released_by_user_id = ?, finance_released_at = datetime('now'),
- finance_funding_detail = ? WHERE id = ?`).run(userId, fundingDetail, poId);
-        trySetPoFullyApprovedAfterFinanceReleases(poId);
-        res.json({ purchaseOrder: loadPoDetail(poId) });
+    r.post("/purchase-orders/:id/release-finance", requireAuth, poReaderPerm, (_req, res) => {
+        res.status(410).json({
+            code: "po_finance_steps_removed",
+            message: "Les validations Finance / Compta ne s’appliquent plus : le bon passe en attente de paiement après les visas Manager et Direction générale.",
+        });
     });
-    r.post("/purchase-orders/:id/release-accounting", requireAuth, releaseAccountingPerm, (req, res) => {
-        const poId = routeParamId(req.params.id);
-        const userId = req.auth?.sub;
-        if (!userId) {
-            res.status(401).json({ code: "unauthorized" });
-            return;
-        }
-        const bodyParsed = releaseFundingBodySchema.safeParse(req.body ?? {});
-        if (!bodyParsed.success) {
-            res.status(400).json({ code: "validation_error" });
-            return;
-        }
-        const fundingDetail = bodyParsed.data.fundingDetail.trim();
-        if (!fundingDetail) {
-            res.status(400).json({ code: "funding_detail_required" });
-            return;
-        }
-        const row = db
-            .prepare(`SELECT status, finance_released_by_user_id AS f, accounting_released_by_user_id AS a
-         FROM stock_purchase_orders WHERE id = ?`)
-            .get(poId);
-        if (!row) {
-            res.status(404).json({ code: "not_found" });
-            return;
-        }
-        if (row.status !== "pending_finance") {
-            res.status(400).json({ code: "invalid_status" });
-            return;
-        }
-        if (row.a) {
-            res.status(400).json({ code: "already_released" });
-            return;
-        }
-        if (row.f === userId) {
-            res.status(400).json({ code: "same_releaser" });
-            return;
-        }
-        db.prepare(`UPDATE stock_purchase_orders SET accounting_released_by_user_id = ?, accounting_released_at = datetime('now'),
-         accounting_funding_detail = ? WHERE id = ?`).run(userId, fundingDetail, poId);
-        trySetPoFullyApprovedAfterFinanceReleases(poId);
-        res.json({ purchaseOrder: loadPoDetail(poId) });
+    r.post("/purchase-orders/:id/release-accounting", requireAuth, poReaderPerm, (_req, res) => {
+        res.status(410).json({
+            code: "po_finance_steps_removed",
+            message: "Les validations Finance / Compta ne s’appliquent plus : le bon passe en attente de paiement après les visas Manager et Direction générale.",
+        });
     });
     r.post("/purchase-orders/:id/reject", requireAuth, requireRejectPurchaseOrder, (req, res) => {
         const schema = z.object({ note: z.string().max(2000).optional().default("") });
@@ -672,7 +585,7 @@ export function inventoryPurchaseOrderRoutes() {
             res.status(404).json({ code: "not_found" });
             return;
         }
-        if (row.status !== "submitted" && row.status !== "pending_finance") {
+        if (row.status !== "submitted" && row.status !== "pending_payment") {
             res.status(400).json({ code: "invalid_status" });
             return;
         }

@@ -2,6 +2,7 @@ import { useAuth } from "@/auth/AuthContext";
 import { useTheme } from "@/theme/ThemeContext";
 import type { ThemePreference } from "@/theme/themeStorage";
 import { StockDepotsSettingsPanel } from "@/components/settings/StockDepotsSettingsPanel";
+import { TerraceTablesSettingsPanel } from "@/components/settings/TerraceTablesSettingsPanel";
 import { StockItemCategoriesSettingsPanel } from "@/components/settings/StockItemCategoriesSettingsPanel";
 import { StockItemSubcategoriesSettingsPanel } from "@/components/settings/StockItemSubcategoriesSettingsPanel";
 import { StockItemUnitsSettingsPanel } from "@/components/settings/StockItemUnitsSettingsPanel";
@@ -1557,7 +1558,8 @@ export function Settings() {
       (tab === "stockArticleCategories" ||
         tab === "stockArticleUnits" ||
         tab === "stockArticleSubcategories" ||
-        tab === "stockDepots") &&
+        tab === "stockDepots" ||
+        tab === "terraceTables") &&
       !canEditSettings
     ) {
       setTab(firstTab);
@@ -2170,6 +2172,10 @@ export function Settings() {
 
             {tab === "stockDepots" && (
               <StockDepotsSettingsPanel readOnly={categoriesReadOnly} baseId={baseId} />
+            )}
+
+            {tab === "terraceTables" && (
+              <TerraceTablesSettingsPanel readOnly={categoriesReadOnly} baseId={baseId} />
             )}
 
             {tab === "users" && (

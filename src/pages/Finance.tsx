@@ -16,6 +16,7 @@ import {
   LineChart,
   Moon,
   ShoppingBag,
+  UtensilsCrossed,
   Wallet,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -25,6 +26,7 @@ const BRANCH_LABEL: Record<NonNullable<(typeof FINANCE_HUB_CARDS)[number]["branc
   treasury: "Trésorerie",
   cashbook: "Caisse & banque",
   counter: "Points de vente",
+  service: "Service salle",
   billing: "Facturation",
   lodging: "Hébergement",
   audit: "Contrôle",
@@ -39,6 +41,8 @@ function branchHue(branch: (typeof FINANCE_HUB_CARDS)[number]["branch"]): string
       return "from-teal-500/22";
     case "counter":
       return "from-brand-cream/20";
+    case "service":
+      return "from-orange-500/20";
     case "billing":
       return "from-brand-orange/22";
     case "lodging":
@@ -60,6 +64,8 @@ function cardIcon(branch: (typeof FINANCE_HUB_CARDS)[number]["branch"]): LucideI
       return BookText;
     case "counter":
       return ShoppingBag;
+    case "service":
+      return UtensilsCrossed;
     case "billing":
       return Banknote;
     case "lodging":

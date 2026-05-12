@@ -10,6 +10,7 @@ export const FINANCE_MENU_GATE = [
   "finance.payments",
   "finance.invoices",
   "finance.counter",
+  "sales.floor",
   "finance.treasury",
   "finance.cash_book",
   "finance.reports",
@@ -31,6 +32,7 @@ export const FINANCE_MODULE_PATHS: readonly string[] = [
   "/paiement",
   "/facturation",
   "/comptoir",
+  "/service-salle",
   "/tresorerie",
   "/livre-caisse",
   "/rapports",
@@ -47,7 +49,7 @@ export type FinanceHubCard = {
   title: string;
   description: string;
   /** Sous-domaine affiché sur la carte (ex. trésorerie). */
-  branch?: "treasury" | "counter" | "billing" | "lodging" | "audit" | "reports" | "cashbook";
+  branch?: "treasury" | "counter" | "billing" | "lodging" | "audit" | "reports" | "cashbook" | "service";
   anyOf: readonly string[];
 };
 
@@ -72,7 +74,15 @@ export const FINANCE_HUB_CARDS: readonly FinanceHubCard[] = [
     title: "Vente comptoir",
     description: "Buvette, boutique : ventes ponctuelles en CDF par point de vente.",
     branch: "counter",
-    anyOf: ["finance.counter"],
+    anyOf: ["finance.counter", "finance.treasury"],
+  },
+  {
+    to: "/service-salle",
+    title: "Service salle",
+    description:
+      "Tables terrasse et additions : le serveur dispose du catalogue ; pour la caisse « terrasse seule », créez un rôle personnalisé avec vente comptoir, sans service en salle ni trésorerie ; la trésorerie voit tout.",
+    branch: "service",
+    anyOf: ["sales.floor", "finance.counter", "finance.treasury"],
   },
   {
     to: "/tresorerie",

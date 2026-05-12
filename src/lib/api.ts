@@ -12,6 +12,12 @@ import type {
   Client,
   ClientProfileType,
   CounterSale,
+  CounterSaleDetail,
+  CounterSaleMenuItem,
+  CounterDiningTableOption,
+  DiningTerraceTableSetting,
+  FloorBoardCell,
+  FloorServiceTabDetail,
   FinanceCashAccount,
   FinanceCashMovement,
   FinanceCashMovementCategory,
@@ -55,6 +61,7 @@ import type {
   TreasuryRegisterReport,
   UserInvitationPending,
   UserRole,
+  TerracePointOfSaleOption,
   VisitorEntryPaymentLedgerRow,
   PaymentCurrencyCode,
 } from "@/types";
@@ -505,6 +512,10 @@ export async function apiListCounterSales(params?: {
       ...s,
       pointOfSaleId: s.pointOfSaleId ?? null,
       pointOfSaleLabel: s.pointOfSaleLabel ?? null,
+      diningTableId: s.diningTableId ?? null,
+      diningTableCode: s.diningTableCode ?? null,
+      diningTableLabel: s.diningTableLabel ?? null,
+      linesCount: typeof s.linesCount === "number" ? s.linesCount : undefined,
     }));
   } catch {
     return null;
@@ -567,8 +578,19 @@ export function nightAuditExportUrl(date: string, format: "csv" | "json"): strin
   return apiUrl(`/api/night-audit/export?${q}`);
 }
 
+/** Champs optionnels renvoyés avec `code: insufficient_pos_stock`. */
+export type CounterSaleApiErrorExtras = {
+  itemId?: string;
+  itemLabel?: string;
+  requestedQty?: number;
+  availableQty?: number;
+};
+
 export type CreateCounterSaleInput = {
-  amountCdf: number;
+  /** Montant direct (vente sans catalogue) ; incompatible avec `lines`. */
+  amountCdf?: number;
+  lines?: { itemId: string; qty: number }[];
+  diningTableId?: string;
   method?: ReservationPaymentMethod;
   label?: string;
   note?: string;
@@ -578,7 +600,7 @@ export type CreateCounterSaleInput = {
 
 export async function apiCreateCounterSale(
   body: CreateCounterSaleInput,
-): Promise<{ ok: true; sale: CounterSale } | { ok: false; code: string }> {
+): Promise<{ ok: true; sale: CounterSale } | ({ ok: false; code: string } & CounterSaleApiErrorExtras)> {
   try {
     const res = await fetch(apiUrl("/api/counter-sales"), {
       method: "POST",
@@ -586,15 +608,270 @@ export async function apiCreateCounterSale(
       credentials: "include",
       body: JSON.stringify(body),
     });
-    const data = await parseJson<{ sale?: CounterSale; code?: string }>(res);
+    const data = await parseJson<{
+      sale?: CounterSale;
+      code?: string;
+      itemId?: string;
+      itemLabel?: string;
+      requestedQty?: number;
+      availableQty?: number;
+    }>(res);
     if (res.status === 201 && data?.sale) return { ok: true, sale: data.sale };
+    if (data?.code === "unknown_or_unpriced_item")
+      return { ok: false, code: "unknown_or_unpriced_item" };
+    if (res.status === 400 && data?.code === "item_not_on_pos_catalog") {
+      return {
+        ok: false,
+        code: "item_not_on_pos_catalog",
+        itemId: typeof data.itemId === "string" ? data.itemId : undefined,
+      };
+    }
+    if (res.status === 400 && data?.code === "insufficient_pos_stock") {
+      return {
+        ok: false,
+        code: "insufficient_pos_stock",
+        itemId: typeof data.itemId === "string" ? data.itemId : undefined,
+        itemLabel: typeof data.itemLabel === "string" ? data.itemLabel : undefined,
+        requestedQty: typeof data.requestedQty === "number" ? data.requestedQty : undefined,
+        availableQty: typeof data.availableQty === "number" ? data.availableQty : undefined,
+      };
+    }
     if (res.status === 400 && data?.code === "unknown_client") return { ok: false, code: "unknown_client" };
+    if (res.status === 400 && data?.code === "amount_or_lines") return { ok: false, code: "amount_or_lines" };
+    if (res.status === 400 && data?.code === "invalid_table") return { ok: false, code: "invalid_table" };
     if (res.status === 400) return { ok: false, code: "validation_error" };
     if (res.status === 401) return { ok: false, code: "unauthorized" };
     if (res.status === 403) return { ok: false, code: data?.code ?? "forbidden" };
     return { ok: false, code: data?.code ?? "error" };
   } catch {
     return { ok: false, code: "network_error" };
+  }
+}
+
+export async function apiGetCounterSaleMenu(pointOfSaleId?: string): Promise<{
+  cdfPerUsd: number;
+  items: CounterSaleMenuItem[];
+  pointOfSaleId: string;
+} | null> {
+  try {
+    const q = pointOfSaleId ? new URLSearchParams({ pointOfSaleId }) : "";
+    const suffix = q.toString() ? `?${q.toString()}` : "";
+    const res = await fetch(apiUrl(`/api/counter-sales/menu${suffix}`), { credentials: "include" });
+    if (!res.ok) return null;
+    const data = await parseJson<{
+      cdfPerUsd?: number;
+      items?: CounterSaleMenuItem[];
+      pointOfSaleId?: string;
+    }>(res);
+    if (!data?.items || typeof data.pointOfSaleId !== "string") return null;
+    return {
+      cdfPerUsd: typeof data.cdfPerUsd === "number" ? data.cdfPerUsd : 0,
+      items: data.items,
+      pointOfSaleId: data.pointOfSaleId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function apiListCounterDiningTablesForPos(pointOfSaleId: string): Promise<CounterDiningTableOption[] | null> {
+  try {
+    const q = new URLSearchParams({ pointOfSaleId });
+    const res = await fetch(apiUrl(`/api/counter-sales/dining-tables?${q}`), { credentials: "include" });
+    if (!res.ok) return null;
+    const data = await parseJson<{ tables?: CounterDiningTableOption[] }>(res);
+    return Array.isArray(data?.tables) ? data.tables : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function apiGetFloorTabsBoard(
+  pointOfSaleId: string,
+): Promise<{ board: FloorBoardCell[]; hiddenBusyTables: number } | null> {
+  try {
+    const q = new URLSearchParams({ pointOfSaleId });
+    const res = await fetch(apiUrl(`/api/floor-tabs/board?${q}`), { credentials: "include" });
+    if (!res.ok) return null;
+    const data = await parseJson<{
+      board?: FloorBoardCell[];
+      hiddenBusyTables?: number;
+    }>(res);
+    if (!Array.isArray(data?.board)) return null;
+    return {
+      board: data.board,
+      hiddenBusyTables: typeof data.hiddenBusyTables === "number" ? data.hiddenBusyTables : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function apiOpenFloorTab(body: {
+  pointOfSaleId: string;
+  diningTableId: string;
+}): Promise<{ ok: true; tab: FloorServiceTabDetail } | { ok: false; code: string; openedByName?: string }> {
+  try {
+    const res = await fetch(apiUrl("/api/floor-tabs/open"), {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await parseJson<{
+      tab?: FloorServiceTabDetail;
+      code?: string;
+      openedByName?: string;
+    }>(res);
+    if ((res.status === 200 || res.status === 201) && data?.tab) return { ok: true, tab: data.tab };
+    if (res.status === 409) return { ok: false, code: data?.code ?? "table_busy", openedByName: data?.openedByName };
+    return { ok: false, code: data?.code ?? "error" };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
+export async function apiGetFloorTab(tabId: string): Promise<FloorServiceTabDetail | null> {
+  try {
+    const res = await fetch(apiUrl(`/api/floor-tabs/${encodeURIComponent(tabId)}`), {
+      credentials: "include",
+    });
+    if (!res.ok) return null;
+    const data = await parseJson<{ tab?: FloorServiceTabDetail }>(res);
+    return data?.tab ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function apiPutFloorTabLines(
+  tabId: string,
+  body: { lines: { itemId: string; qty: number }[] },
+): Promise<
+  | { ok: true; tab: FloorServiceTabDetail }
+  | ({ ok: false; code: string } & CounterSaleApiErrorExtras)
+> {
+  try {
+    const res = await fetch(apiUrl(`/api/floor-tabs/${encodeURIComponent(tabId)}/lines`), {
+      method: "PUT",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await parseJson<{
+      tab?: FloorServiceTabDetail;
+      code?: string;
+      itemId?: string;
+      itemLabel?: string;
+      requestedQty?: number;
+      availableQty?: number;
+    }>(res);
+    if (res.ok && data?.tab) return { ok: true, tab: data.tab };
+    const base = { ok: false as const, code: data?.code ?? "error" };
+    if (data?.code === "insufficient_pos_stock") {
+      return {
+        ...base,
+        itemId: typeof data.itemId === "string" ? data.itemId : undefined,
+        itemLabel: typeof data.itemLabel === "string" ? data.itemLabel : undefined,
+        requestedQty: typeof data.requestedQty === "number" ? data.requestedQty : undefined,
+        availableQty: typeof data.availableQty === "number" ? data.availableQty : undefined,
+      };
+    }
+    if (data?.code === "item_not_on_pos_catalog") {
+      return { ...base, itemId: typeof data.itemId === "string" ? data.itemId : undefined };
+    }
+    return { ...base, itemId: typeof data?.itemId === "string" ? data.itemId : undefined };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
+export async function apiCheckoutFloorTab(
+  tabId: string,
+  body: {
+    method: ReservationPaymentMethod;
+    note: string;
+    clientId?: string;
+  },
+): Promise<
+  | {
+      ok: true;
+      counterSaleId: string;
+      amountCdf: number;
+      diningTableId: string;
+      pointOfSaleId: string;
+      invoiceRef?: string;
+    }
+  | ({ ok: false; code: string } & CounterSaleApiErrorExtras)
+> {
+  try {
+    const res = await fetch(apiUrl(`/api/floor-tabs/${encodeURIComponent(tabId)}/checkout`), {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await parseJson<{
+      code?: string;
+      itemId?: string;
+      itemLabel?: string;
+      requestedQty?: number;
+      availableQty?: number;
+      counterSaleId?: string;
+      amountCdf?: number;
+      diningTableId?: string;
+      pointOfSaleId?: string;
+      invoiceRef?: string;
+    }>(res);
+    if (res.status === 201 && data?.counterSaleId && typeof data.amountCdf === "number") {
+      return {
+        ok: true,
+        counterSaleId: data.counterSaleId,
+        amountCdf: data.amountCdf,
+        diningTableId: typeof data.diningTableId === "string" ? data.diningTableId : "",
+        pointOfSaleId: typeof data.pointOfSaleId === "string" ? data.pointOfSaleId : "",
+        invoiceRef: typeof data.invoiceRef === "string" ? data.invoiceRef : undefined,
+      };
+    }
+    if (res.status === 400 && data?.code === "insufficient_pos_stock") {
+      return {
+        ok: false,
+        code: "insufficient_pos_stock",
+        itemId: typeof data.itemId === "string" ? data.itemId : undefined,
+        itemLabel: typeof data.itemLabel === "string" ? data.itemLabel : undefined,
+        requestedQty: typeof data.requestedQty === "number" ? data.requestedQty : undefined,
+        availableQty: typeof data.availableQty === "number" ? data.availableQty : undefined,
+      };
+    }
+    return { ok: false, code: data?.code ?? "error" };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
+export async function apiDeleteFloorTab(tabId: string): Promise<{ ok: true } | { ok: false; code: string }> {
+  try {
+    const res = await fetch(apiUrl(`/api/floor-tabs/${encodeURIComponent(tabId)}`), {
+      method: "DELETE",
+      credentials: "include",
+    });
+    if (res.status === 204) return { ok: true };
+    const data = await parseJson<{ code?: string }>(res);
+    return { ok: false, code: data?.code ?? "error" };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
+export async function apiGetCounterSaleDetail(id: string): Promise<CounterSaleDetail | null> {
+  try {
+    const res = await fetch(apiUrl(`/api/counter-sales/${encodeURIComponent(id)}`), { credentials: "include" });
+    if (!res.ok) return null;
+    const data = await parseJson<{ sale?: CounterSaleDetail }>(res);
+    if (!data?.sale || !Array.isArray(data.sale.lines)) return null;
+    return data.sale;
+  } catch {
+    return null;
   }
 }
 
@@ -2370,6 +2647,71 @@ export async function apiInventoryLocations(): Promise<StockLocation[] | null> {
   }
 }
 
+/** Points de vente (caisse / terrasse) liés à un emplacement de stock — logistique. */
+export type InventoryPointOfSale = {
+  id: string;
+  code: string;
+  label: string;
+  sortOrder: number;
+  isMain: boolean;
+  stockLocationId: string;
+  stockLocationLabel: string;
+};
+
+export async function apiInventoryPointsOfSale(): Promise<InventoryPointOfSale[] | null> {
+  try {
+    const res = await fetch(apiUrl("/api/inventory/points-of-sale"), { credentials: "include" });
+    if (!res.ok) return null;
+    const data = await parseJson<{ pointsOfSale?: InventoryPointOfSale[] }>(res);
+    return Array.isArray(data?.pointsOfSale) ? data.pointsOfSale : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function apiInventoryGetPosCatalog(
+  posId: string,
+): Promise<{ itemIds: string[]; catalogRestricted: boolean } | null> {
+  try {
+    const res = await fetch(
+      apiUrl(`/api/inventory/points-of-sale/${encodeURIComponent(posId)}/catalog`),
+      { credentials: "include" },
+    );
+    if (!res.ok) return null;
+    const data = await parseJson<{ itemIds?: string[]; catalogRestricted?: boolean }>(res);
+    if (!data || !Array.isArray(data.itemIds)) return null;
+    return {
+      itemIds: data.itemIds,
+      catalogRestricted: data.catalogRestricted === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function apiInventoryPutPosCatalog(
+  posId: string,
+  body: { itemIds: string[] },
+): Promise<{ ok: true } | { ok: false; code: string; itemId?: string }> {
+  try {
+    const res = await fetch(apiUrl(`/api/inventory/points-of-sale/${encodeURIComponent(posId)}/catalog`), {
+      method: "PUT",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 204) return { ok: true };
+    const data = await parseJson<{ code?: string; itemId?: string }>(res);
+    return {
+      ok: false,
+      code: data?.code ?? "error",
+      itemId: typeof data?.itemId === "string" ? data.itemId : undefined,
+    };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
 export async function apiInventoryArticleRefs(): Promise<InventoryArticleRefs | null> {
   try {
     const res = await fetch(apiUrl("/api/inventory/article-refs"), { credentials: "include" });
@@ -3046,6 +3388,86 @@ export async function apiPatchStockDepot(
     });
     const data = await parseJson<{ depot?: StockDepotSetting; code?: string }>(res);
     if (res.status === 200 && data?.depot) return { ok: true, depot: data.depot };
+    return { ok: false, code: data?.code ?? "error" };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
+export async function apiListTerracePointsOfSale(): Promise<{ terraces: TerracePointOfSaleOption[] } | null> {
+  try {
+    const res = await fetch(apiUrl("/api/settings/terrace-points-of-sale"), { credentials: "include" });
+    if (!res.ok) return null;
+    return await parseJson<{ terraces: TerracePointOfSaleOption[] }>(res);
+  } catch {
+    return null;
+  }
+}
+
+export async function apiListTerraceDiningTables(
+  pointOfSaleId: string,
+): Promise<{ tables: DiningTerraceTableSetting[] } | null> {
+  try {
+    const q = new URLSearchParams({ pointOfSaleId });
+    const res = await fetch(apiUrl(`/api/settings/terrace-dining-tables?${q.toString()}`), {
+      credentials: "include",
+    });
+    if (!res.ok) return null;
+    return await parseJson<{ tables: DiningTerraceTableSetting[] }>(res);
+  } catch {
+    return null;
+  }
+}
+
+export async function apiPostTerraceDiningTable(body: {
+  pointOfSaleId: string;
+  code: string;
+  label: string;
+  seats?: number;
+  sortOrder?: number;
+}): Promise<{ ok: true; table: DiningTerraceTableSetting } | { ok: false; code: string }> {
+  try {
+    const res = await fetch(apiUrl("/api/settings/terrace-dining-tables"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(body),
+    });
+    const data = await parseJson<{ table?: DiningTerraceTableSetting; code?: string }>(res);
+    if (res.status === 201 && data?.table) return { ok: true, table: data.table };
+    return { ok: false, code: data?.code ?? "error" };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
+export async function apiPatchTerraceDiningTable(
+  id: string,
+  body: { code?: string; label?: string; seats?: number; sortOrder?: number; active?: boolean },
+): Promise<{ ok: true; table: DiningTerraceTableSetting } | { ok: false; code: string }> {
+  try {
+    const res = await fetch(apiUrl(`/api/settings/terrace-dining-tables/${encodeURIComponent(id)}`), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(body),
+    });
+    const data = await parseJson<{ table?: DiningTerraceTableSetting; code?: string }>(res);
+    if (res.status === 200 && data?.table) return { ok: true, table: data.table };
+    return { ok: false, code: data?.code ?? "error" };
+  } catch {
+    return { ok: false, code: "network_error" };
+  }
+}
+
+export async function apiDeleteTerraceDiningTable(id: string): Promise<{ ok: true } | { ok: false; code: string }> {
+  try {
+    const res = await fetch(apiUrl(`/api/settings/terrace-dining-tables/${encodeURIComponent(id)}`), {
+      method: "DELETE",
+      credentials: "include",
+    });
+    if (res.status === 204) return { ok: true };
+    const data = await parseJson<{ code?: string }>(res);
     return { ok: false, code: data?.code ?? "error" };
   } catch {
     return { ok: false, code: "network_error" };

@@ -5,6 +5,7 @@ import {
   Banknote,
   Building2,
   KeyRound,
+  LayoutGrid,
   Layers,
   Package,
   Palette,
@@ -25,6 +26,7 @@ export type SettingsTabId =
   | "stockArticleUnits"
   | "stockArticleSubcategories"
   | "stockDepots"
+  | "terraceTables"
   | "users"
   | "fx"
   | "pricing"
@@ -71,6 +73,12 @@ export const SETTINGS_TAB_DEFS: SettingsTabDef[] = [
     icon: Warehouse,
     perm: "settings.edit",
   },
+  {
+    id: "terraceTables",
+    label: "Tables par terrasse",
+    icon: LayoutGrid,
+    perm: "settings.edit",
+  },
   { id: "users", label: "Utilisateurs", icon: Users, usersTab: true },
   { id: "fx", label: "Taux", icon: ArrowLeftRight, perm: "settings.edit" },
   { id: "pricing", label: "Tarification", icon: Banknote, perm: "settings.edit" },
@@ -93,6 +101,7 @@ const TAB_TO_ONGLET: Record<SettingsTabId, string> = {
   stockArticleUnits: "unites-article",
   stockArticleSubcategories: "sous-categories-article",
   stockDepots: "depots-stock",
+  terraceTables: "tables-terrasse",
   users: "utilisateurs",
   fx: "taux",
   pricing: "tarification",

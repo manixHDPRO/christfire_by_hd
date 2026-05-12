@@ -155,6 +155,79 @@ const patchStockDepotSchema = z.object({
   active: z.boolean().optional(),
 });
 
+function normalizeDiningTableCode(raw: string): string {
+  return raw
+    .trim()
+    .toUpperCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/\s+/g, "-")
+    .replace(/[^A-Z0-9_-]+/g, "")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 32);
+}
+
+const DINING_TABLE_CODE_RE = /^[A-Z0-9_-]{1,32}$/;
+
+const postDiningTerraceTableSchema = z.object({
+  pointOfSaleId: z.string().min(1).max(80),
+  code: z.string().min(1).max(64),
+  label: z.string().trim().min(1).max(120),
+  seats: z.coerce.number().int().min(1).max(99).optional().default(4),
+  sortOrder: z.coerce.number().int().min(0).max(9999).optional(),
+});
+
+const patchDiningTerraceTableSchema = z
+  .object({
+    code: z.string().min(1).max(64).optional(),
+    label: z.string().trim().min(1).max(120).optional(),
+    seats: z.coerce.number().int().min(1).max(99).optional(),
+    sortOrder: z.coerce.number().int().min(0).max(9999).optional(),
+    active: z.boolean().optional(),
+  })
+  .refine(
+    (o) =>
+      o.code !== undefined ||
+      o.label !== undefined ||
+      o.seats !== undefined ||
+      o.sortOrder !== undefined ||
+      o.active !== undefined,
+    { message: "empty_patch" },
+  );
+
+type DiningTerraceTableRow = {
+  id: string;
+  point_of_sale_id: string;
+  code: string;
+  label: string;
+  seats: number;
+  sort_order: number;
+  active: number;
+};
+
+function diningTableToPublic(row: DiningTerraceTableRow) {
+  return {
+    id: row.id,
+    pointOfSaleId: row.point_of_sale_id,
+    code: row.code,
+    label: row.label,
+    seats: row.seats,
+    sortOrder: row.sort_order,
+    active: row.active === 1,
+  };
+}
+
+function diningTableCodeTaken(pointOfSaleId: string, code: string, excludeId?: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT id FROM dining_terrace_tables WHERE point_of_sale_id = ? AND code = ? COLLATE NOCASE`,
+    )
+    .get(pointOfSaleId, code) as { id: string } | undefined;
+  if (!row) return false;
+  if (excludeId && row.id === excludeId) return false;
+  return true;
+}
+
 function allocateUniqueDepotCode(label: string): string {
   let base = normalizeStockDepotCode(label);
   if (!base || !STOCK_DEPOT_CODE_RE.test(base)) {
@@ -981,6 +1054,216 @@ export function settingsRoutes(): Router {
       },
     });
   });
+
+  r.get(
+    "/terrace-points-of-sale",
+    requireAuth,
+    requireAnyPermission("settings.edit"),
+    (_req: AuthedRequest, res: Response) => {
+      const rows = db
+        .prepare(
+          `SELECT id, code, label, sort_order AS sortOrder, active
+           FROM stock_points_of_sale
+           ORDER BY active DESC, is_main DESC, sort_order ASC, code COLLATE NOCASE ASC`,
+        )
+        .all() as { id: string; code: string; label: string; sortOrder: number; active: number }[];
+      res.json({
+        terraces: rows.map((p) => ({
+          id: p.id,
+          code: p.code,
+          label: p.label,
+          sortOrder: p.sortOrder,
+          active: p.active === 1,
+        })),
+      });
+    },
+  );
+
+  r.get("/terrace-dining-tables", requireAuth, requireAnyPermission("settings.edit"), (req: AuthedRequest, res: Response) => {
+    const posId = typeof req.query.pointOfSaleId === "string" ? req.query.pointOfSaleId.trim() : "";
+    if (!posId) {
+      res.status(400).json({ code: "validation_error" });
+      return;
+    }
+    const posOk = db.prepare(`SELECT 1 FROM stock_points_of_sale WHERE id = ?`).get(posId);
+    if (!posOk) {
+      res.status(404).json({ code: "terrace_not_found" });
+      return;
+    }
+    const rows = db
+      .prepare(
+        `SELECT id, point_of_sale_id, code, label, seats, sort_order, active
+         FROM dining_terrace_tables
+         WHERE point_of_sale_id = ?
+         ORDER BY sort_order ASC, code COLLATE NOCASE ASC`,
+      )
+      .all(posId) as DiningTerraceTableRow[];
+    res.json({ tables: rows.map(diningTableToPublic) });
+  });
+
+  r.post(
+    "/terrace-dining-tables",
+    requireAuth,
+    requireAnyPermission("settings.edit"),
+    (req: AuthedRequest, res: Response) => {
+      const parsed = postDiningTerraceTableSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ code: "validation_error" });
+        return;
+      }
+      const codeNorm = normalizeDiningTableCode(parsed.data.code);
+      if (!codeNorm || !DINING_TABLE_CODE_RE.test(codeNorm)) {
+        res.status(400).json({ code: "invalid_code" });
+        return;
+      }
+      const posOk = db
+        .prepare(`SELECT 1 FROM stock_points_of_sale WHERE id = ? AND active = 1`)
+        .get(parsed.data.pointOfSaleId);
+      if (!posOk) {
+        res.status(404).json({ code: "terrace_not_found" });
+        return;
+      }
+      if (diningTableCodeTaken(parsed.data.pointOfSaleId, codeNorm)) {
+        res.status(409).json({ code: "code_exists" });
+        return;
+      }
+      const maxSo = (
+        db
+          .prepare(
+            `SELECT COALESCE(MAX(sort_order), -1) AS m FROM dining_terrace_tables WHERE point_of_sale_id = ?`,
+          )
+          .get(parsed.data.pointOfSaleId) as { m: number }
+      ).m;
+      const sortOrder = parsed.data.sortOrder ?? maxSo + 1;
+      const id = randomUUID();
+      try {
+        db.prepare(
+          `INSERT INTO dining_terrace_tables (id, point_of_sale_id, code, label, seats, sort_order, active)
+           VALUES (?, ?, ?, ?, ?, ?, 1)`,
+        ).run(
+          id,
+          parsed.data.pointOfSaleId,
+          codeNorm,
+          parsed.data.label.trim(),
+          parsed.data.seats,
+          sortOrder,
+        );
+      } catch (e) {
+        console.error(e);
+        res.status(500).json({ code: "insert_failed" });
+        return;
+      }
+      recordAudit({
+        actorUserId: req.auth?.sub ?? null,
+        action: "create",
+        entityType: "settings",
+        entityId: "dining-terrace-table",
+        summary: `Table salle ${codeNorm} (${parsed.data.label.trim()}) · terrasse ${parsed.data.pointOfSaleId}`,
+      });
+      const row = db
+        .prepare(
+          `SELECT id, point_of_sale_id, code, label, seats, sort_order, active FROM dining_terrace_tables WHERE id = ?`,
+        )
+        .get(id) as DiningTerraceTableRow;
+      res.status(201).json({ table: diningTableToPublic(row) });
+    },
+  );
+
+  r.patch(
+    "/terrace-dining-tables/:id",
+    requireAuth,
+    requireAnyPermission("settings.edit"),
+    (req: AuthedRequest, res: Response) => {
+      const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+      if (!id) {
+        res.status(400).json({ code: "validation_error" });
+        return;
+      }
+      const parsed = patchDiningTerraceTableSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ code: "validation_error" });
+        return;
+      }
+      const existing = db
+        .prepare(
+          `SELECT id, point_of_sale_id, code, label, seats, sort_order, active FROM dining_terrace_tables WHERE id = ?`,
+        )
+        .get(id) as DiningTerraceTableRow | undefined;
+      if (!existing) {
+        res.status(404).json({ code: "not_found" });
+        return;
+      }
+      let nextCode = existing.code;
+      if (parsed.data.code !== undefined) {
+        const codeNorm = normalizeDiningTableCode(parsed.data.code);
+        if (!codeNorm || !DINING_TABLE_CODE_RE.test(codeNorm)) {
+          res.status(400).json({ code: "invalid_code" });
+          return;
+        }
+        if (diningTableCodeTaken(existing.point_of_sale_id, codeNorm, id)) {
+          res.status(409).json({ code: "code_exists" });
+          return;
+        }
+        nextCode = codeNorm;
+      }
+      const nextLabel = parsed.data.label !== undefined ? parsed.data.label.trim() : existing.label;
+      const nextSeats = parsed.data.seats !== undefined ? parsed.data.seats : existing.seats;
+      const nextSort = parsed.data.sortOrder !== undefined ? parsed.data.sortOrder : existing.sort_order;
+      let nextActive = parsed.data.active !== undefined ? (parsed.data.active ? 1 : 0) : existing.active;
+
+      try {
+        db.prepare(
+          `UPDATE dining_terrace_tables SET code = ?, label = ?, seats = ?, sort_order = ?, active = ? WHERE id = ?`,
+        ).run(nextCode, nextLabel, nextSeats, nextSort, nextActive, id);
+      } catch (e) {
+        console.error(e);
+        res.status(500).json({ code: "update_failed" });
+        return;
+      }
+      recordAudit({
+        actorUserId: req.auth?.sub ?? null,
+        action: "update",
+        entityType: "settings",
+        entityId: "dining-terrace-table",
+        summary: `Table salle ${nextCode} mise à jour`,
+      });
+      const row = db
+        .prepare(
+          `SELECT id, point_of_sale_id, code, label, seats, sort_order, active FROM dining_terrace_tables WHERE id = ?`,
+        )
+        .get(id) as DiningTerraceTableRow;
+      res.json({ table: diningTableToPublic(row) });
+    },
+  );
+
+  r.delete(
+    "/terrace-dining-tables/:id",
+    requireAuth,
+    requireAnyPermission("settings.edit"),
+    (req: AuthedRequest, res: Response) => {
+      const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+      if (!id) {
+        res.status(400).json({ code: "validation_error" });
+        return;
+      }
+      const existing = db
+        .prepare(`SELECT code FROM dining_terrace_tables WHERE id = ?`)
+        .get(id) as { code: string } | undefined;
+      if (!existing) {
+        res.status(404).json({ code: "not_found" });
+        return;
+      }
+      db.prepare(`DELETE FROM dining_terrace_tables WHERE id = ?`).run(id);
+      recordAudit({
+        actorUserId: req.auth?.sub ?? null,
+        action: "delete",
+        entityType: "settings",
+        entityId: "dining-terrace-table",
+        summary: `Table salle ${existing.code} supprimée`,
+      });
+      res.status(204).end();
+    },
+  );
 
   return r;
 }

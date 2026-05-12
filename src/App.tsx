@@ -23,6 +23,7 @@ import { Reports } from "@/pages/Reports";
 import { Reservations } from "@/pages/Reservations";
 import { Settings } from "@/pages/Settings";
 import { LogistiqueIndexRedirect } from "@/pages/LogistiqueIndexRedirect";
+import { ServiceSalle } from "@/pages/ServiceSalle";
 import { Stocks } from "@/pages/Stocks";
 import { StocksLegacyRedirect } from "@/pages/StocksLegacyRedirect";
 import { Treasury } from "@/pages/Treasury";
@@ -136,6 +137,14 @@ export default function App() {
             element={
               <RequirePermission anyOf={[...mainNavRequiredPermissions("/comptoir")]}>
                 <CounterSales />
+              </RequirePermission>
+            }
+          />
+          <Route
+            path="service-salle"
+            element={
+              <RequirePermission anyOf={[...mainNavRequiredPermissions("/service-salle")]}>
+                <ServiceSalle />
               </RequirePermission>
             }
           />

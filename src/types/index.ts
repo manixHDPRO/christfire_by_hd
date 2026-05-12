@@ -23,13 +23,15 @@ export type ReservationKind = "individual" | "group";
 /** Canal d’acquisition (rapports / pilotage). */
 export type BookingChannel = "direct" | "ota" | "telephone" | "agence" | "autre";
 
-/** Vente au comptoir / buvette (CDF), sans réservation bungalow. */
+/** Vente au comptoir / service salle (CDF), sans réservation bungalow. */
 export interface CounterSale {
   id: string;
+  /** Référence facture (`CF-AAAAMMJJ-NNNN`, date sans tirets) — commune au bon cuisine et au journal de caisse. */
+  invoiceRef?: string;
   /** Montant encaissé en francs congolais (entier). */
   amountCdf: number;
   method: string;
-  /** Libellé court (ex. « Boissons », « Souvenir »). */
+  /** Libellé court ou récap. articles. */
   label: string;
   note: string;
   clientId: string | null;
@@ -39,6 +41,97 @@ export interface CounterSale {
   createdAt: string;
   pointOfSaleId: string | null;
   pointOfSaleLabel: string | null;
+  /** Table (service salle), si renseignée. */
+  diningTableId?: string | null;
+  diningTableCode?: string | null;
+  diningTableLabel?: string | null;
+  /** Nombre de lignes article (zéro = vente montant libre). */
+  linesCount?: number;
+}
+
+export interface CounterSaleLine {
+  id: string;
+  itemId: string;
+  qty: number;
+  unitPriceUsdCents: number;
+  lineTotalCdf: number;
+  label: string;
+}
+
+/** Détail vente avec lignes (GET /api/counter-sales/:id). */
+export interface CounterSaleDetail extends CounterSale {
+  lines: CounterSaleLine[];
+}
+
+export interface CounterSaleMenuItem {
+  id: string;
+  code: string;
+  label: string;
+  unit: string;
+  unitLabel: string;
+  salePriceUsdCents: number;
+  unitPriceCdf: number;
+  /** Boissons stockées au point de vente (sous-cat. logistique) : contrôle de quantité locale. */
+  requiresPosStock?: boolean;
+  /** Solde mouvements de stock pour l’emplacement lié à la caisse/terrasse (si applies). */
+  qtyAtSaleLocation?: number;
+}
+
+/** Liste des tables pour une caisse (service salle). */
+export interface CounterDiningTableOption {
+  id: string;
+  code: string;
+  label: string;
+  seats: number;
+  sortOrder: number;
+}
+
+/** Plan de salle (tables + onglets ouverts service salle). */
+export type FloorBoardCell =
+  | {
+      tableId: string;
+      code: string;
+      label: string;
+      seats: number;
+      sortOrder: number;
+      vacant: true;
+    }
+  | {
+      tableId: string;
+      code: string;
+      label: string;
+      seats: number;
+      sortOrder: number;
+      vacant: false;
+      tabId: string | null;
+      canEdit: boolean;
+      openedByName?: string;
+      lineCount?: number;
+      totalCdf?: number;
+    };
+
+/** Détail addition en cours pour une table (GET /api/floor-tabs/:id). */
+export interface FloorServiceTabDetail {
+  id: string;
+  /** Référence facture (`CF-AAAAMMJJ-NNNN`) — identique après encaisse sur la vente caisse et sur le bon PDF. */
+  invoiceRef: string;
+  pointOfSaleId: string;
+  diningTableId: string;
+  tableCode: string;
+  tableLabel: string;
+  openedByUserId: string;
+  /** Nom affiché du serveur qui a ouvert l’addition (caisse / ticket). */
+  openedByName?: string;
+  openedAt: string;
+  note: string;
+  lines: {
+    itemId: string;
+    qty: number;
+    label: string;
+    unitPriceUsdCents: number;
+    lineTotalCdf: number;
+  }[];
+  totalCdf: number;
 }
 
 /** Synthèse ventes comptoir par caisse et par jour (trésorerie). */
@@ -676,7 +769,13 @@ export interface OperationalWorkflowListItem {
 }
 
 /** Catégories « métier » articles stock (codes référentiels en base). */
-export type StockItemCategory = "general" | "restauration" | "minibar" | "linge";
+export type StockItemCategory =
+  | "general"
+  | "restauration"
+  | "minibar"
+  | "linge"
+  | "hygiene_entretien"
+  | "consommables_chambre";
 
 /** GET /api/inventory/article-refs — catégories, unités et sous-catégories actives. */
 export interface InventoryArticleRefs {
@@ -699,6 +798,26 @@ export interface StockDepotSetting {
   id: string;
   code: string;
   label: string;
+  sortOrder: number;
+  active: boolean;
+}
+
+/** Point de vente / terrasse (caisse comptoir) pour configuration des tables salle. */
+export interface TerracePointOfSaleOption {
+  id: string;
+  code: string;
+  label: string;
+  sortOrder: number;
+  active: boolean;
+}
+
+/** Table de salle rattachée à une terrasse (point de vente). */
+export interface DiningTerraceTableSetting {
+  id: string;
+  pointOfSaleId: string;
+  code: string;
+  label: string;
+  seats: number;
   sortOrder: number;
   active: boolean;
 }

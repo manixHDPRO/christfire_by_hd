@@ -713,9 +713,16 @@ db.exec(`
     insRolePerm.run("sys-ur-compta", c);
     insRolePerm.run("sys-ur-comptable", c);
   }
-  for (const c of ["finance.counter", "directory.clients"]) {
-    insRolePerm.run("sys-ur-serveur", c);
-  }
+  /** Serveur(se) : répertoire ; service salle via `sales.floor` (pas droit caisse comptoir). */
+  insRolePerm.run("sys-ur-serveur", "directory.clients");
+  db.prepare(
+    `DELETE FROM app_role_permissions WHERE role_id = 'sys-ur-serveur' AND permission_code = 'finance.counter'`,
+  ).run();
+}
+
+{
+  db.prepare(`DELETE FROM app_role_permissions WHERE role_id = 'sys-ur-caissiere-terrasse'`).run();
+  db.prepare(`DELETE FROM app_user_roles WHERE id = 'sys-ur-caissiere-terrasse'`).run();
 }
 
 {
@@ -1004,7 +1011,7 @@ db.exec(`
     CREATE TABLE IF NOT EXISTS stock_purchase_orders (
       id TEXT PRIMARY KEY,
       supplier_id TEXT NOT NULL REFERENCES stock_suppliers(id),
-      status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'submitted', 'pending_finance', 'approved', 'rejected', 'closed')),
+      status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'submitted', 'pending_payment', 'approved', 'rejected', 'closed')),
       note TEXT NOT NULL DEFAULT '',
       external_ref TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1048,7 +1055,7 @@ db.exec(`
         CREATE TABLE stock_purchase_orders_mig (
           id TEXT PRIMARY KEY,
           supplier_id TEXT NOT NULL REFERENCES stock_suppliers(id),
-          status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'submitted', 'pending_finance', 'approved', 'rejected', 'closed')),
+          status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'submitted', 'pending_payment', 'approved', 'rejected', 'closed')),
           note TEXT NOT NULL DEFAULT '',
           external_ref TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1114,6 +1121,51 @@ db.exec(`
     }
   }
 
+  const poCreateSqlRow = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'stock_purchase_orders'")
+    .get() as { sql: string } | undefined;
+  const poCreateSql = poCreateSqlRow?.sql ?? "";
+  if (poCreateSql.includes("pending_finance")) {
+    db.pragma("foreign_keys = OFF");
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const createPp = poCreateSql
+        .replace(/^CREATE TABLE stock_purchase_orders\b/m, "CREATE TABLE stock_purchase_orders__pp")
+        .replace(
+          /CHECK\s*\(\s*status\s+IN\s*\([^)]+\)\s*\)/i,
+          "CHECK (status IN ('draft', 'submitted', 'pending_payment', 'approved', 'rejected', 'closed'))",
+        );
+      db.exec("DROP TABLE IF EXISTS stock_purchase_orders__pp");
+      db.exec(createPp);
+      const colMeta = db
+        .prepare("PRAGMA table_info(stock_purchase_orders)")
+        .all() as { name: string; cid: number }[];
+      const colNames = [...colMeta].sort((a, b) => a.cid - b.cid).map((r) => r.name);
+      const selectParts = colNames.map((c) =>
+        c === "status"
+          ? `(CASE WHEN status = 'pending_finance' THEN 'pending_payment' ELSE status END)`
+          : c,
+      );
+      db.exec(
+        `INSERT INTO stock_purchase_orders__pp (${colNames.join(", ")}) SELECT ${selectParts.join(", ")} FROM stock_purchase_orders`,
+      );
+      db.exec(`DROP TABLE stock_purchase_orders`);
+      db.exec(`ALTER TABLE stock_purchase_orders__pp RENAME TO stock_purchase_orders`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_stock_po_status ON stock_purchase_orders(status)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_stock_po_supplier ON stock_purchase_orders(supplier_id)`);
+      db.exec("COMMIT");
+    } catch (e) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    } finally {
+      db.pragma("foreign_keys = ON");
+    }
+  }
+
   const doccols = db.prepare("PRAGMA table_info(stock_documents)").all() as { name: string }[];
   if (!doccols.some((c) => c.name === "purchase_order_id")) {
     db.exec(
@@ -1146,26 +1198,34 @@ db.exec(`
     CREATE INDEX IF NOT EXISTS idx_stock_item_subcats_cat ON stock_item_subcategories(category_code);
   `);
 
-  const nStockCats = (db.prepare("SELECT COUNT(*) AS c FROM stock_item_categories").get() as { c: number }).c;
-  if (nStockCats === 0) {
-    const ins = db.prepare(
-      `INSERT INTO stock_item_categories (code, label, sort_order, active) VALUES (@code, @label, @sort_order, 1)`,
-    );
-    ins.run({ code: "general", label: "Général", sort_order: 0 });
-    ins.run({ code: "restauration", label: "Restauration", sort_order: 1 });
-    ins.run({ code: "minibar", label: "Minibar", sort_order: 2 });
-    ins.run({ code: "linge", label: "Linge", sort_order: 3 });
+  /** Référentiel catégories : toujours INSERT OR IGNORE pour bases manquantes (évite FK sous-catégories si la table n’était pas vide sans les codes standard). */
+  const insCatOrIgnore = db.prepare(
+    `INSERT OR IGNORE INTO stock_item_categories (code, label, sort_order, active) VALUES (@code, @label, @sort_order, 1)`,
+  );
+  for (const row of [
+    { code: "general", label: "Général", sort_order: 0 },
+    { code: "restauration", label: "Restauration", sort_order: 1 },
+    { code: "minibar", label: "Minibar", sort_order: 2 },
+    { code: "linge", label: "Linge", sort_order: 3 },
+    { code: "hygiene_entretien", label: "Hygiène & entretien", sort_order: 4 },
+    { code: "consommables_chambre", label: "Consommables chambre", sort_order: 5 },
+  ] as const) {
+    insCatOrIgnore.run(row);
   }
 
-  const nStockUnits = (db.prepare("SELECT COUNT(*) AS c FROM stock_item_units").get() as { c: number }).c;
-  if (nStockUnits === 0) {
-    const ins = db.prepare(
-      `INSERT INTO stock_item_units (code, label, sort_order, active) VALUES (@code, @label, @sort_order, 1)`,
-    );
-    ins.run({ code: "unite", label: "Unité", sort_order: 0 });
-    ins.run({ code: "kg", label: "Kilogramme", sort_order: 1 });
-    ins.run({ code: "l", label: "Litre", sort_order: 2 });
-    ins.run({ code: "carton", label: "Carton", sort_order: 3 });
+  const insUnitOrIgnore = db.prepare(
+    `INSERT OR IGNORE INTO stock_item_units (code, label, sort_order, active) VALUES (@code, @label, @sort_order, 1)`,
+  );
+  for (const row of [
+    { code: "unite", label: "Unité", sort_order: 0 },
+    { code: "kg", label: "Kilogramme", sort_order: 1 },
+    { code: "l", label: "Litre", sort_order: 2 },
+    { code: "carton", label: "Carton", sort_order: 3 },
+    { code: "colis", label: "Colis / pack", sort_order: 4 },
+    { code: "rouleau", label: "Rouleau", sort_order: 5 },
+    { code: "palette", label: "Palette", sort_order: 6 },
+  ] as const) {
+    insUnitOrIgnore.run(row);
   }
 
   const stockItemsSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='stock_items'")
@@ -1245,6 +1305,36 @@ db.exec(`
 
   db.prepare(`UPDATE stock_items SET category = 'general' WHERE category NOT IN (SELECT code FROM stock_item_categories)`).run();
   db.prepare(`UPDATE stock_items SET unit = 'unite' WHERE unit NOT IN (SELECT code FROM stock_item_units)`).run();
+
+  const defaultStockSubcategories: { code: string; category_code: string; label: string; sort_order: number }[] = [
+    { code: "divers", category_code: "general", label: "Divers", sort_order: 10 },
+    { code: "fournitures_bureau", category_code: "general", label: "Fournitures bureau", sort_order: 20 },
+    { code: "aliments_secs", category_code: "restauration", label: "Aliments secs", sort_order: 10 },
+    { code: "aliments_frais", category_code: "restauration", label: "Produits frais", sort_order: 20 },
+    { code: "surgeles", category_code: "restauration", label: "Surgelés", sort_order: 30 },
+    { code: "epices_condiments", category_code: "restauration", label: "Épices & condiments", sort_order: 40 },
+    { code: "boissons_service", category_code: "restauration", label: "Boissons (service restauration / bar)", sort_order: 50 },
+    { code: "boissons_alcool_service", category_code: "restauration", label: "Boissons alcool (service)", sort_order: 60 },
+    { code: "soft", category_code: "minibar", label: "Sans alcool", sort_order: 10 },
+    { code: "alcool", category_code: "minibar", label: "Avec alcool", sort_order: 20 },
+    { code: "encas", category_code: "minibar", label: "Encas", sort_order: 30 },
+    { code: "lit", category_code: "linge", label: "Linge de lit", sort_order: 10 },
+    { code: "bain", category_code: "linge", label: "Linge de bain", sort_order: 20 },
+    { code: "piscine", category_code: "linge", label: "Linge / textile piscine", sort_order: 30 },
+    { code: "papier_sanitaire", category_code: "hygiene_entretien", label: "Papier sanitaire", sort_order: 10 },
+    { code: "papier_menager", category_code: "hygiene_entretien", label: "Papier ménager", sort_order: 20 },
+    { code: "sacs_dechets", category_code: "hygiene_entretien", label: "Sacs & déchets", sort_order: 30 },
+    { code: "produits_nettoyage", category_code: "hygiene_entretien", label: "Produits nettoyage", sort_order: 40 },
+    { code: "desinfection", category_code: "hygiene_entretien", label: "Désinfection", sort_order: 50 },
+    { code: "amenities", category_code: "consommables_chambre", label: "Produits d'accueil", sort_order: 10 },
+    { code: "jetable_chambre", category_code: "consommables_chambre", label: "Jetable chambre", sort_order: 20 },
+  ];
+  const insSubOrIgnore = db.prepare(
+    `INSERT OR IGNORE INTO stock_item_subcategories (code, category_code, label, sort_order, active) VALUES (@code, @category_code, @label, @sort_order, 1)`,
+  );
+  for (const row of defaultStockSubcategories) {
+    insSubOrIgnore.run(row);
+  }
 
   const stockItemCols = db.prepare("PRAGMA table_info(stock_items)").all() as { name: string }[];
   if (!stockItemCols.some((c) => c.name === "unit_qty")) {
@@ -1618,4 +1708,326 @@ db.exec(`
     );
     CREATE INDEX IF NOT EXISTS idx_treasury_cash_day_pos_openings_pos ON treasury_cash_day_pos_openings(point_of_sale_id);
   `);
+}
+
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dining_terrace_tables (
+      id TEXT PRIMARY KEY,
+      point_of_sale_id TEXT NOT NULL REFERENCES stock_points_of_sale(id) ON DELETE CASCADE,
+      code TEXT NOT NULL,
+      label TEXT NOT NULL,
+      seats INTEGER NOT NULL DEFAULT 4 CHECK(seats >= 1 AND seats <= 99),
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(point_of_sale_id, code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_dining_terrace_tables_pos ON dining_terrace_tables(point_of_sale_id);
+  `);
+}
+
+{
+  const csCols = db.prepare("PRAGMA table_info(counter_sales)").all() as { name: string }[];
+  if (!csCols.some((c) => c.name === "dining_table_id")) {
+    db.exec(
+      `ALTER TABLE counter_sales ADD COLUMN dining_table_id TEXT REFERENCES dining_terrace_tables(id) ON DELETE SET NULL`,
+    );
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS counter_sale_lines (
+      id TEXT PRIMARY KEY,
+      sale_id TEXT NOT NULL REFERENCES counter_sales(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+      qty INTEGER NOT NULL CHECK(qty >= 1 AND qty <= 9999),
+      unit_price_usd_cents INTEGER NOT NULL CHECK(unit_price_usd_cents >= 0),
+      line_total_cdf INTEGER NOT NULL CHECK(line_total_cdf >= 0),
+      label_snapshot TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_counter_sale_lines_sale ON counter_sale_lines(sale_id);
+  `);
+}
+
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS floor_service_tabs (
+      id TEXT PRIMARY KEY,
+      point_of_sale_id TEXT NOT NULL REFERENCES stock_points_of_sale(id) ON DELETE CASCADE,
+      dining_table_id TEXT NOT NULL REFERENCES dining_terrace_tables(id) ON DELETE CASCADE,
+      opened_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+      opened_at TEXT NOT NULL DEFAULT (datetime('now')),
+      note TEXT NOT NULL DEFAULT '',
+      settled_at TEXT,
+      counter_sale_id TEXT REFERENCES counter_sales(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_floor_tabs_pos ON floor_service_tabs(point_of_sale_id);
+    CREATE INDEX IF NOT EXISTS idx_floor_tabs_open ON floor_service_tabs(point_of_sale_id, dining_table_id) WHERE settled_at IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_floor_one_open_tab_per_table ON floor_service_tabs(dining_table_id) WHERE settled_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS floor_service_tab_lines (
+      id TEXT PRIMARY KEY,
+      tab_id TEXT NOT NULL REFERENCES floor_service_tabs(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE RESTRICT,
+      qty INTEGER NOT NULL CHECK(qty >= 1 AND qty <= 9999),
+      UNIQUE(tab_id, item_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_floor_tab_lines_tab ON floor_service_tab_lines(tab_id);
+  `);
+}
+
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stock_item_point_of_sale (
+      item_id TEXT NOT NULL REFERENCES stock_items(id) ON DELETE CASCADE,
+      point_of_sale_id TEXT NOT NULL REFERENCES stock_points_of_sale(id) ON DELETE CASCADE,
+      PRIMARY KEY (item_id, point_of_sale_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_stock_item_point_of_sale_pos ON stock_item_point_of_sale(point_of_sale_id);
+  `);
+}
+
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS counter_sale_serial (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      next_n INTEGER NOT NULL DEFAULT 1 CHECK (next_n >= 1)
+    );
+    INSERT OR IGNORE INTO counter_sale_serial (id, next_n) VALUES (1, 1);
+  `);
+
+  const csColsSaleNo = db.prepare("PRAGMA table_info(counter_sales)").all() as { name: string }[];
+  if (!csColsSaleNo.some((c) => c.name === "sale_number")) {
+    db.exec(`ALTER TABLE counter_sales ADD COLUMN sale_number INTEGER`);
+  }
+
+  const ftColsSaleNo = db.prepare("PRAGMA table_info(floor_service_tabs)").all() as { name: string }[];
+  if (!ftColsSaleNo.some((c) => c.name === "sale_number")) {
+    db.exec(`ALTER TABLE floor_service_tabs ADD COLUMN sale_number INTEGER`);
+  }
+
+  const pendingBackfill = db
+    .prepare(`SELECT COUNT(*) AS c FROM counter_sales WHERE sale_number IS NULL`)
+    .get() as { c: number };
+  if (pendingBackfill.c > 0) {
+    const rows = db
+      .prepare(`SELECT id FROM counter_sales WHERE sale_number IS NULL ORDER BY datetime(created_at) ASC, id ASC`)
+      .all() as { id: string }[];
+    const maxExisting = Number(
+      (db.prepare(`SELECT COALESCE(MAX(sale_number), 0) AS m FROM counter_sales WHERE sale_number IS NOT NULL`).get() as {
+        m: number;
+      })?.m ?? 0,
+    );
+    let next = maxExisting + 1;
+    const stmtUp = db.prepare(`UPDATE counter_sales SET sale_number = ? WHERE id = ?`);
+    for (const row of rows) {
+      stmtUp.run(next++, row.id);
+    }
+    const syncedMax = Number(
+      (db.prepare(`SELECT COALESCE(MAX(sale_number), 0) AS m FROM counter_sales`).get() as { m: number })?.m ?? 0,
+    );
+    db.prepare(`UPDATE counter_sale_serial SET next_n = ?`).run(syncedMax + 1);
+  } else {
+    const maxAll = Number(
+      (db.prepare(`SELECT COALESCE(MAX(sale_number), 0) AS m FROM counter_sales`).get() as { m: number })?.m ?? 0,
+    );
+    const seqNow = db.prepare(`SELECT next_n FROM counter_sale_serial WHERE id = 1`).get() as { next_n: number };
+    const synced = Math.max(typeof seqNow?.next_n === "number" ? seqNow.next_n : 1, maxAll + 1);
+    db.prepare(`UPDATE counter_sale_serial SET next_n = ?`).run(synced);
+  }
+
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS ux_counter_sales_sale_number ON counter_sales(sale_number) WHERE sale_number IS NOT NULL`,
+  );
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS ux_floor_service_tabs_sale_number ON floor_service_tabs(sale_number) WHERE sale_number IS NOT NULL`,
+  );
+}
+
+/** AAAAMMJJ sans tirets dans `invoice_ref` (clé `business_date` inchangée : AAAA-MM-JJ). */
+function businessDateSegmentForInvoice(isoYmd: string): string {
+  const s = isoYmd.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/u.test(s)) return s.replace(/-/g, "");
+  const digits = s.replace(/\D/g, "").slice(0, 8);
+  return digits.length === 8 ? digits : "19700101";
+}
+
+/** Ancienne `CF-AAAA-MM-JJ-NNNN` ou actuelle `CF-AAAAMMJJ-NNNN` → `{ isoDay, seqNum }`. */
+function parseCfCounterInvoiceParts(ref: string): { isoDay: string; seqNum: number } | null {
+  const t = ref.trim();
+  const legacy = /^CF-(\d{4}-\d{2}-\d{2})-(\d{4})$/u.exec(t);
+  if (legacy) {
+    const seqNum = Number.parseInt(legacy[2]!, 10);
+    if (!Number.isFinite(seqNum)) return null;
+    return { isoDay: legacy[1]!, seqNum };
+  }
+  const cur = /^CF-(\d{8})-(\d{4})$/u.exec(t);
+  if (cur) {
+    const c = cur[1]!;
+    const seqNum = Number.parseInt(cur[2]!, 10);
+    if (c.length !== 8 || !Number.isFinite(seqNum)) return null;
+    const isoDay = `${c.slice(0, 4)}-${c.slice(4, 6)}-${c.slice(6, 8)}`;
+    return { isoDay, seqNum };
+  }
+  return null;
+}
+
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS counter_invoice_daily_seq (
+      business_date TEXT NOT NULL PRIMARY KEY CHECK (length(business_date) = 10),
+      next_seq INTEGER NOT NULL DEFAULT 1 CHECK (next_seq >= 1)
+    );
+  `);
+
+  const csInv = db.prepare("PRAGMA table_info(counter_sales)").all() as { name: string }[];
+  if (!csInv.some((c) => c.name === "invoice_ref")) {
+    db.exec(`ALTER TABLE counter_sales ADD COLUMN invoice_ref TEXT`);
+  }
+  const ftInv = db.prepare("PRAGMA table_info(floor_service_tabs)").all() as { name: string }[];
+  if (!ftInv.some((c) => c.name === "invoice_ref")) {
+    db.exec(`ALTER TABLE floor_service_tabs ADD COLUMN invoice_ref TEXT`);
+  }
+
+  const invNull = db.prepare(`SELECT COUNT(*) AS c FROM counter_sales WHERE invoice_ref IS NULL OR trim(invoice_ref) = ''`).get() as {
+    c: number;
+  };
+  if (invNull.c > 0) {
+    const perDayMax = new Map<string, number>();
+    const seeded = db
+      .prepare(`SELECT invoice_ref FROM counter_sales WHERE invoice_ref IS NOT NULL AND length(trim(invoice_ref)) > 0`)
+      .all() as { invoice_ref: string }[];
+    for (const { invoice_ref } of seeded) {
+      const parsed = parseCfCounterInvoiceParts(invoice_ref);
+      if (!parsed) continue;
+      perDayMax.set(parsed.isoDay, Math.max(perDayMax.get(parsed.isoDay) ?? 0, parsed.seqNum));
+    }
+    const rows = db
+      .prepare(
+        `SELECT id, created_at FROM counter_sales WHERE invoice_ref IS NULL OR trim(invoice_ref) = ''
+         ORDER BY datetime(created_at) ASC, id ASC`,
+      )
+      .all() as { id: string; created_at: string }[];
+    const stmtSet = db.prepare(`UPDATE counter_sales SET invoice_ref = ? WHERE id = ?`);
+    for (const row of rows) {
+      let d = "";
+      if (typeof row.created_at === "string" && /^\d{4}-\d{2}-\d{2}/u.test(row.created_at)) {
+        d = row.created_at.slice(0, 10);
+      } else {
+        const parsed = db
+          .prepare(`SELECT strftime('%Y-%m-%d', ?) AS d`)
+          .get(row.created_at) as { d: string } | undefined;
+        d = parsed?.d ?? "1970-01-01";
+      }
+      const next = (perDayMax.get(d) ?? 0) + 1;
+      perDayMax.set(d, next);
+      stmtSet.run(`CF-${businessDateSegmentForInvoice(d)}-${String(next).padStart(4, "0")}`, row.id);
+    }
+    for (const [d, mx] of perDayMax.entries()) {
+      db.prepare(
+        `INSERT INTO counter_invoice_daily_seq (business_date, next_seq) VALUES (?, ?)
+         ON CONFLICT(business_date) DO UPDATE SET next_seq = MAX(counter_invoice_daily_seq.next_seq, excluded.next_seq)`,
+      ).run(d, mx + 1);
+    }
+  }
+
+  db.prepare(
+    `UPDATE floor_service_tabs SET invoice_ref = (
+       SELECT cs.invoice_ref FROM counter_sales cs WHERE cs.id = floor_service_tabs.counter_sale_id
+     )
+     WHERE counter_sale_id IS NOT NULL
+       AND (invoice_ref IS NULL OR trim(invoice_ref) = '')`,
+  ).run();
+
+  {
+    const upCs = db.prepare(`UPDATE counter_sales SET invoice_ref = ? WHERE id = ?`);
+    const csRows = db
+      .prepare(`SELECT id, invoice_ref FROM counter_sales WHERE invoice_ref IS NOT NULL AND length(trim(invoice_ref)) > 0`)
+      .all() as { id: string; invoice_ref: string }[];
+    for (const r of csRows) {
+      const p = parseCfCounterInvoiceParts(r.invoice_ref);
+      if (!p) continue;
+      const norm = `CF-${businessDateSegmentForInvoice(p.isoDay)}-${String(p.seqNum).padStart(4, "0")}`;
+      if (norm !== r.invoice_ref.trim()) upCs.run(norm, r.id);
+    }
+    const upFt = db.prepare(`UPDATE floor_service_tabs SET invoice_ref = ? WHERE id = ?`);
+    const ftRows = db
+      .prepare(`SELECT id, invoice_ref FROM floor_service_tabs WHERE invoice_ref IS NOT NULL AND length(trim(invoice_ref)) > 0`)
+      .all() as { id: string; invoice_ref: string }[];
+    for (const r of ftRows) {
+      const p = parseCfCounterInvoiceParts(r.invoice_ref);
+      if (!p) continue;
+      const norm = `CF-${businessDateSegmentForInvoice(p.isoDay)}-${String(p.seqNum).padStart(4, "0")}`;
+      if (norm !== r.invoice_ref.trim()) upFt.run(norm, r.id);
+    }
+  }
+
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS ux_counter_sales_invoice_ref ON counter_sales(invoice_ref) WHERE invoice_ref IS NOT NULL AND length(trim(invoice_ref)) > 0`,
+  );
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS ux_floor_service_tabs_invoice_ref ON floor_service_tabs(invoice_ref) WHERE invoice_ref IS NOT NULL AND length(trim(invoice_ref)) > 0`,
+  );
+}
+
+/**
+ * Référence de facture comptoir : `CF-{AAAAMMJJ}-{NNNN}` (compteur par jour métier, clé interne `AAAA-MM-JJ`).
+ * À utiliser uniquement dans une transaction SQLite englobante.
+ */
+export function allocateNextInvoiceRefUnsafe(businessDate: string): string {
+  db.prepare(`INSERT OR IGNORE INTO counter_invoice_daily_seq (business_date, next_seq) VALUES (?, 1)`).run(businessDate);
+  db.prepare(`UPDATE counter_invoice_daily_seq SET next_seq = next_seq + 1 WHERE business_date = ?`).run(businessDate);
+  const r = db
+    .prepare(`SELECT next_seq FROM counter_invoice_daily_seq WHERE business_date = ?`)
+    .get(businessDate) as { next_seq: number } | undefined;
+  const seq = typeof r?.next_seq === "number" && Number.isFinite(r.next_seq) && r.next_seq >= 2 ? r.next_seq - 1 : 1;
+  return `CF-${businessDateSegmentForInvoice(businessDate)}-${String(seq).padStart(4, "0")}`;
+}
+
+/** Onglet service salle : rattache une référence facture dès l’addition ouverte (`opened_at`). */
+export function assignInvoiceRefIfMissingForOpenTabUnsafe(tabId: string): string {
+  const row = db
+    .prepare(`SELECT invoice_ref, opened_at FROM floor_service_tabs WHERE id = ? AND settled_at IS NULL`)
+    .get(tabId) as { invoice_ref: string | null; opened_at: string } | undefined;
+  if (!row) {
+    throw new Error("floor_tab_not_open");
+  }
+  if (row.invoice_ref && row.invoice_ref.trim().length > 0) return row.invoice_ref;
+  const biz = typeof row.opened_at === "string" ? row.opened_at.slice(0, 10) : "1970-01-01";
+  const inv = allocateNextInvoiceRefUnsafe(biz);
+  const info = db
+    .prepare(
+      `UPDATE floor_service_tabs SET invoice_ref = ? WHERE id = ? AND settled_at IS NULL AND (invoice_ref IS NULL OR trim(invoice_ref) = '')`,
+    )
+    .run(inv, tabId);
+  if (info.changes > 0) return inv;
+  const retry = db
+    .prepare(`SELECT invoice_ref FROM floor_service_tabs WHERE id = ? AND settled_at IS NULL`)
+    .get(tabId) as { invoice_ref: string | null } | undefined;
+  if (retry?.invoice_ref && retry.invoice_ref.trim().length > 0) return retry.invoice_ref;
+  throw new Error("floor_tab_invoice_ref_race");
+}
+
+export function ensureFloorTabInvoiceRef(tabId: string): string | null {
+  try {
+    return db.transaction(() => assignInvoiceRefIfMissingForOpenTabUnsafe(tabId))();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @deprecated Conservé pour d’anciens chemins ; préférez les références `invoice_ref`.
+ */
+export function nextSaleSequenceNumberUnsafe(): number {
+  const row = db.prepare(`SELECT next_n FROM counter_sale_serial WHERE id = 1`).get() as { next_n: number } | undefined;
+  const allocated = typeof row?.next_n === "number" && Number.isFinite(row.next_n) && row.next_n >= 1 ? row.next_n : 1;
+  db.prepare(`UPDATE counter_sale_serial SET next_n = next_n + 1 WHERE id = 1`).run();
+  return allocated;
+}
+
+{
+  const insFloorPerm = db.prepare(
+    `INSERT OR IGNORE INTO app_role_permissions (role_id, permission_code) VALUES (?, ?)`,
+  );
+  insFloorPerm.run("sys-ur-serveur", "sales.floor");
 }

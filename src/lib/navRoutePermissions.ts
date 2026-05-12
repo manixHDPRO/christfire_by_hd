@@ -10,7 +10,8 @@ export const MAIN_NAV_ROUTE_PERMS: Readonly<Record<string, MainNavGate>> = {
   "/finance": [...FINANCE_MENU_GATE],
   "/rapports": ["finance.reports", "lodging.reservations"],
   "/paiement": ["finance.payments"],
-  "/comptoir": ["finance.counter"],
+  "/comptoir": ["finance.counter", "finance.treasury"],
+  "/service-salle": ["sales.floor", "finance.counter", "finance.treasury"],
   "/tresorerie": [
     "finance.treasury",
     "finance.counter",

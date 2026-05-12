@@ -5,6 +5,7 @@ import { roleHasPermission } from "./permissions.js";
 /** Qui peut consulter si la journée caisse est ouverte (bannières, formulaires). */
 export const CASH_DAY_STATUS_READ_PERMS = [
   "finance.counter",
+  "sales.floor",
   "finance.treasury",
   "finance.payments",
   "lodging.reservations",

@@ -1,11 +1,11 @@
 import { useAuth } from "@/auth/AuthContext";
 import { Breadcrumb } from "@/components/layout/Breadcrumb";
 import { apiListPurchaseOrders, apiUrl } from "@/lib/api";
-import { userHasAnyPermission } from "@/lib/permissions";
+import { userHasAnyPermission, userHasPermission } from "@/lib/permissions";
 import { reservationBungalowIds, normalizeReservationFromApi } from "@/lib/reservationBungalows";
 import { reservationPaymentStatus, reservationsOpenForBilling } from "@/lib/reservationBilling";
 import { reservationGrandTotal } from "@/lib/reservationPayment";
-import type { Bungalow, Client, Reservation } from "@/types";
+import type { Bungalow, Client, PurchaseOrderListRow, Reservation } from "@/types";
 import { motion } from "framer-motion";
 import { AlertTriangle, CalendarCheck, ClipboardList, Flame, TrendingUp, Wallet } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -38,6 +38,21 @@ const PO_APPROVER_PERMS = ["logistics.po_approve_manager", "logistics.po_approve
 
 type DashboardAlert = { type: "info" | "warn"; text: string };
 
+/** Regroupe les BC « soumis » par type de visa encore manquant. */
+function summarizeSubmittedApprovals(rows: PurchaseOrderListRow[]): {
+  total: number;
+  pendingManager: number;
+  pendingDg: number;
+} {
+  let pendingManager = 0;
+  let pendingDg = 0;
+  for (const r of rows) {
+    if (!r.managerApprovedAt) pendingManager += 1;
+    if (!r.dgApprovedAt) pendingDg += 1;
+  }
+  return { total: rows.length, pendingManager, pendingDg };
+}
+
 export function Dashboard() {
   const { user } = useAuth();
   const [reservations, setReservations] = useState<Reservation[]>([]);
@@ -46,25 +61,33 @@ export function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [apiError, setApiError] = useState(false);
   const [dashboardPartial, setDashboardPartial] = useState(false);
-  /** Nombre de BC au statut « soumis » (en attente d’approbation). `null` = pas chargé ou pas le droit de lecture. */
-  const [submittedPoCount, setSubmittedPoCount] = useState<number | null>(null);
+  /** BC « soumis » + détail des visas Manager / Direction encore requis. `null` = pas chargé ou pas le droit de lecture. */
+  const [submittedPoSummary, setSubmittedPoSummary] = useState<ReturnType<
+    typeof summarizeSubmittedApprovals
+  > | null>(null);
 
   const canReadPoOnDashboard = useMemo(
     () => userHasAnyPermission(user, PO_DASHBOARD_READ_PERMS),
     [user],
   );
   const isPoApprover = useMemo(() => userHasAnyPermission(user, PO_APPROVER_PERMS), [user]);
+  const canVisaManager = useMemo(() => userHasPermission(user, "logistics.po_approve_manager"), [user]);
+  const canVisaDg = useMemo(() => userHasPermission(user, "logistics.po_approve_dg"), [user]);
 
   useEffect(() => {
     if (!canReadPoOnDashboard) {
-      setSubmittedPoCount(null);
+      setSubmittedPoSummary(null);
       return;
     }
     let cancelled = false;
     void (async () => {
       const rows = await apiListPurchaseOrders("submitted");
       if (cancelled) return;
-      setSubmittedPoCount(rows === null ? null : rows.length);
+      if (rows === null) {
+        setSubmittedPoSummary(null);
+        return;
+      }
+      setSubmittedPoSummary(summarizeSubmittedApprovals(rows));
     })();
     return () => {
       cancelled = true;
@@ -279,11 +302,11 @@ export function Dashboard() {
 
       {!apiError &&
       !loading &&
-      submittedPoCount != null &&
-      submittedPoCount > 0 &&
+      submittedPoSummary != null &&
+      submittedPoSummary.total > 0 &&
       canReadPoOnDashboard ? (
         <div
-          className={`mb-4 flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded-r-md border border-y border-r border-white/10 py-1.5 pl-2.5 pr-3 text-[12px] leading-tight ${
+          className={`mb-4 flex flex-col gap-1.5 rounded-r-md border border-y border-r border-white/10 py-1.5 pl-2.5 pr-3 text-[12px] leading-snug sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-0.5 ${
             isPoApprover
               ? "border-l-4 border-l-amber-500/75 bg-white/[0.02]"
               : "border-l-4 border-l-sky-500/55 bg-white/[0.02]"
@@ -291,32 +314,64 @@ export function Dashboard() {
           role="status"
           aria-live="polite"
         >
-          <ClipboardList
-            className={`h-3.5 w-3.5 shrink-0 ${isPoApprover ? "text-amber-400/90" : "text-sky-400/85"}`}
-            aria-hidden
-          />
-          <span className="font-medium text-white/88">
-            {isPoApprover ? "BC à viser" : "BC en attente"}
-            <span className="font-normal text-white/55"> — </span>
-          </span>
-          <span className="text-white/65">
-            {isPoApprover
-              ? submittedPoCount === 1
-                ? "1 soumis par la logistique (Manager ou DG)."
-                : `${submittedPoCount} soumis par la logistique (Manager ou DG).`
-              : submittedPoCount === 1
-                ? "1 bon après soumission logistique."
-                : `${submittedPoCount} bons après soumission logistique.`}
-          </span>
-          <span className="hidden text-white/25 sm:inline" aria-hidden>
-            ·
-          </span>
-          <Link
-            to="/logistique/commandes"
-            className="shrink-0 font-medium text-brand-orange/90 underline decoration-brand-orange/35 underline-offset-2 hover:text-brand-orange sm:no-underline sm:hover:underline"
-          >
-            Ouvrir
-          </Link>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+            <ClipboardList
+              className={`h-3.5 w-3.5 shrink-0 ${isPoApprover ? "text-amber-400/90" : "text-sky-400/85"}`}
+              aria-hidden
+            />
+            <span className="font-medium text-white/88">
+              {isPoApprover ? "BC à viser" : "BC en attente"}
+              <span className="font-normal text-white/55"> — </span>
+            </span>
+            <span className="text-white/65">
+              {submittedPoSummary.total === 1 ? "1 bon au statut soumis · " : `${submittedPoSummary.total} bons au statut soumis · `}
+              <span className="text-white/75">
+                {submittedPoSummary.pendingManager > 0
+                  ? `Manager : ${submittedPoSummary.pendingManager} bon(s) sans visa`
+                  : "Manager : tout visé"}
+                {" · "}
+                {submittedPoSummary.pendingDg > 0
+                  ? `Direction : ${submittedPoSummary.pendingDg} bon(s) sans visa`
+                  : "Direction : tout visé"}
+              </span>
+            </span>
+            <span className="hidden text-white/25 sm:inline" aria-hidden>
+              ·
+            </span>
+            <Link
+              to="/logistique/commandes"
+              className="shrink-0 font-medium text-brand-orange/90 underline decoration-brand-orange/35 underline-offset-2 hover:text-brand-orange sm:no-underline sm:hover:underline"
+            >
+              Ouvrir
+            </Link>
+          </div>
+          {isPoApprover ? (
+            <p className="text-[11px] text-white/45 sm:ml-6 sm:pl-0">
+              {canVisaManager && submittedPoSummary.pendingManager > 0 ? (
+                <span className="text-amber-200/80">
+                  Vous (Manager) : {submittedPoSummary.pendingManager} bon(s) sans ce visa — vous pouvez viser.
+                </span>
+              ) : null}
+              {canVisaManager && submittedPoSummary.pendingManager > 0 && canVisaDg && submittedPoSummary.pendingDg > 0 ? (
+                <span className="text-white/30"> · </span>
+              ) : null}
+              {canVisaDg && submittedPoSummary.pendingDg > 0 ? (
+                <span className="text-amber-200/80">
+                  Vous (Direction) : {submittedPoSummary.pendingDg} bon(s) sans ce visa — vous pouvez viser.
+                </span>
+              ) : null}
+              {submittedPoSummary.pendingManager > 0 && !canVisaManager ? (
+                <span className="block sm:inline sm:before:content-['·_'] sm:before:text-white/30">
+                  Visa Manager encore requis (profil dédié, ce n’est pas votre rôle).
+                </span>
+              ) : null}
+              {submittedPoSummary.pendingDg > 0 && !canVisaDg ? (
+                <span className="mt-0.5 block text-white/40 sm:mt-0 sm:inline sm:before:content-['·_'] sm:before:text-white/30">
+                  Visa Direction encore requis (profil dédié, ce n’est pas votre rôle).
+                </span>
+              ) : null}
+            </p>
+          ) : null}
         </div>
       ) : null}
 
